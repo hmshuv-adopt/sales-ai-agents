@@ -115,13 +115,46 @@ Reads a **CSV of contacts** (for example from events or list uploads), automatic
 7. **Generate LinkedIn connection notes** (max 300 chars each) for use when sending connection requests
 8. **Send a digest email** with draft emails and LinkedIn notes ready for review
 
+### CSV Outreach Email Generator Flow
+
+```
+┌─────────────────┐      ┌──────────────────────┐      ┌─────────────────┐
+│   CSV File      │ ───▶ │ Detect & Map Headers │ ───▶ │  Build Per-Lead │
+│ (Contacts list) │      │  (email, company,    │      │  Context Block  │
+└─────────────────┘      │  title, sector, etc.)│      └────────┬────────┘
+                               │                                  │
+                               ▼                                  │
+                       ┌──────────────────┐                       │
+                       │  Optional        │                       │
+                       │  Apollo Enrich   │◀──────────────────────┘
+                       │  + Knowledge Base│
+                       │  + Web Search    │
+                       └────────┬─────────┘
+                                │
+                        ┌───────▼────────┐
+                        │   Claude AI    │
+                        │  (InMail body) │
+                        └────────┬───────┘
+                                 │
+                        ┌────────▼─────────┐
+                        │   Output File    │
+                        │ (JSON or CSV)    │
+                        └──────────────────┘
+```
+
+1. **Read the CSV** and **auto-detect headers**, normalizing many common names (e.g. "E-mail Address", "Full name", "Job Title", "Priority Project 1").
+2. **Build a CSV-specific context block** by calling Claude once with the header list so the system prompt understands what data this upload contains.
+3. For each contact, **construct a context bundle** from CSV fields, optional Apollo enrichment, knowledge-base snippets, and optional Parallel.ai web search.
+4. **Generate a single LinkedIn InMail-style body** (≈80 words) for that contact using the shared system prompt plus per-contact context.
+5. **Write results** either as JSON (with full context and bodies) or as a new CSV with `email_id,email_body` columns suitable for uploading back into your tools.
+
 ## Quick Start
 
 ### 1. Clone the Repository
 
 ```bash
-git clone https://github.com/sneurgaonkar/sales-followup-agent.git
-cd sales-followup-agent
+git clone https://github.com/sneurgaonkar/sales-ai-agents.git
+cd sales-ai-agents
 ```
 
 ### 2. Install Dependencies
