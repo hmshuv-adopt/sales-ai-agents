@@ -3,18 +3,20 @@
 Lead Finder AI Agent
 
 This script identifies high-engagement but stale leads in HubSpot (Marketing Contacts without deals)
-and generates personalized outreach emails by enriching context from multiple sources.
+and generates personalized outreach by enriching context from multiple sources. For each lead it
+produces both an email and a short LinkedIn connection note (for use when sending a connection request).
 
 Workflow:
 1. Query HubSpot for Marketing Contacts (hs_marketable_status = true)
-2. Exclude contacts associated with deals
+2. Exclude contacts already processed (tracked in processed_contacts_log.json)
 3. Apply configurable filters (employee size, industry, country, job title, lifecycle stage)
-4. Score contacts by engagement (email opens/clicks, website visits, form submissions, meetings)
-5. Filter for stale contacts (no activity in 14+ days)
-6. Rank top 10 by engagement score
-7. Enrich with context from Apollo, Slack, and Fireflies
+4. Score contacts by engagement (HubSpot lead scoring or custom: email opens/clicks, page views, etc.)
+5. Filter for stale contacts (no activity in STALE_THRESHOLD_DAYS; optional)
+6. Rank and select top N leads (N = TOP_LEADS_COUNT), split between assigned recipients (e.g. 10 → 5 each)
+7. Enrich with context from Apollo, Slack, and Fireflies, and knowledge base (RAG)
 8. Generate personalized outreach emails using Claude
-9. Send a digest email to the sales team
+9. Generate LinkedIn connection notes (max 300 characters) for each lead using Claude
+10. Send a digest email to the sales team with emails and LinkedIn notes
 
 Usage:
     python lead_finder_agent.py
@@ -27,10 +29,12 @@ Environment Variables Required:
     FROM_EMAIL - Sender email address for the digest
 
 Optional Environment Variables:
+    TOP_LEADS_COUNT - Total number of top leads to process (default: 10). Split evenly between recipients.
     APOLLO_API_KEY - Apollo.io API key for contact/company enrichment
     SLACK_BOT_TOKEN - Slack Bot OAuth token for searching internal discussions
     SLACK_CHANNELS - Comma-separated list of Slack channels to search
     FIREFLIES_API_KEY - Fireflies.ai API key for searching call transcripts
+    USE_HUBSPOT_SCORING - Use HubSpot lead_scoring_* properties (default: true); false = custom engagement score
     
 Contact Filtering (all optional):
     MIN_EMPLOYEE_SIZE - Minimum company employee size (default: 200)
@@ -43,9 +47,12 @@ Contact Filtering (all optional):
 
 import os
 import json
+import html as html_module
 import requests
+import random
 from datetime import datetime, timedelta
 from typing import Optional
+from urllib.parse import urlparse
 import anthropic
 from dotenv import load_dotenv
 
@@ -71,11 +78,11 @@ if not LEAD_FINDER_RECIPIENTS:
 # Sender email for digest
 FROM_EMAIL = os.getenv("FROM_EMAIL", "noreply@example.com")
 
-# Days threshold for stale contacts
-STALE_THRESHOLD_DAYS = int(os.getenv("STALE_THRESHOLD_DAYS", "14"))
+# Days threshold for stale contacts (optional, default: 14)
+STALE_THRESHOLD_DAYS = int(os.getenv("STALE_THRESHOLD_DAYS", "14")) if os.getenv("STALE_THRESHOLD_DAYS") else None
 
-# Contact filtering configuration
-MIN_EMPLOYEE_SIZE = int(os.getenv("MIN_EMPLOYEE_SIZE", "200"))
+# Contact filtering configuration (all optional)
+MIN_EMPLOYEE_SIZE = int(os.getenv("MIN_EMPLOYEE_SIZE", "0")) if os.getenv("MIN_EMPLOYEE_SIZE") else 0
 
 TARGET_INDUSTRIES = [
     ind.strip() 
@@ -111,6 +118,33 @@ SLACK_CHANNELS = [
 
 # Number of top leads to include in digest
 TOP_LEADS_COUNT = int(os.getenv("TOP_LEADS_COUNT", "10"))
+
+# Engagement scoring method: "hubspot" (use HubSpot lead_scoring_total) or "custom" (calculate custom score)
+USE_HUBSPOT_SCORING = os.getenv("USE_HUBSPOT_SCORING", "true").lower() == "true"
+
+# Path to the processed contacts log file
+PROCESSED_CONTACTS_LOG = os.path.join(os.path.dirname(__file__), "processed_contacts_log.json")
+
+# Lead scoring threshold priority order (highest to lowest)
+LEAD_SCORING_PRIORITY = {
+    "A1": 1,
+    "A2": 2,
+    "B1": 3,
+    "A3": 4,
+    "B2": 5,
+    "C1": 6,
+    "B3": 7,
+    "C2": 8,
+    "C3": 9
+}
+
+def get_lead_scoring_priority(threshold: str) -> int:
+    """Get priority value for lead scoring threshold.
+    
+    Lower number = higher priority.
+    Returns 999 if threshold is not in priority list.
+    """
+    return LEAD_SCORING_PRIORITY.get(threshold.upper(), 999)
 
 
 class HubSpotLeadClient:
@@ -490,6 +524,23 @@ class SlackClient:
         return "\n".join(formatted_messages)
 
 
+def extract_domain(url: str) -> str:
+    """Extract domain from URL (e.g. https://www.acme.com/path -> acme.com)."""
+    if not url or not str(url).strip():
+        return ""
+    url = str(url).strip()
+    if not url.startswith(("http://", "https://")):
+        url = "https://" + url
+    try:
+        parsed = urlparse(url)
+        netloc = parsed.netloc or ""
+        if netloc.startswith("www."):
+            netloc = netloc[4:]
+        return netloc.lower() if netloc else ""
+    except Exception:
+        return ""
+
+
 class FirefliesClient:
     """Client for Fireflies.ai API interactions."""
     
@@ -727,8 +778,117 @@ class KnowledgeBaseClient:
         return "\n\n---\n\n".join(formatted)
 
 
-def calculate_engagement_score(contact: dict, meeting_count: int = 0) -> int:
-    """Calculate engagement score for a contact based on HubSpot activity properties.
+def load_processed_contacts_log() -> dict:
+    """Load the processed contacts log file.
+    
+    Processed contacts are only added after a run completes (digest built and sent). Each run
+    adds the TOP_LEADS_COUNT leads it processed (top N by priority; order in the file is
+    arbitrary because we store sets). Failed runs do not add to the log.
+    
+    Returns:
+        Dictionary with 'processed_contact_ids' (set of contact IDs) and 'processed_emails' (set of emails)
+    """
+    if not os.path.exists(PROCESSED_CONTACTS_LOG):
+        return {
+            "processed_contact_ids": set(),
+            "processed_emails": set(),
+            "last_updated": None
+        }
+    
+    try:
+        with open(PROCESSED_CONTACTS_LOG, "r") as f:
+            data = json.load(f)
+            return {
+                "processed_contact_ids": set(data.get("processed_contact_ids", [])),
+                "processed_emails": set(data.get("processed_emails", [])),
+                "last_updated": data.get("last_updated")
+            }
+    except (json.JSONDecodeError, IOError) as e:
+        print(f"   ⚠️ Error loading processed contacts log: {e}")
+        return {
+            "processed_contact_ids": set(),
+            "processed_emails": set(),
+            "last_updated": None
+        }
+
+
+def save_processed_contacts_log(processed_contact_ids: set, processed_emails: set):
+    """Save the processed contacts log file.
+    
+    Args:
+        processed_contact_ids: Set of contact IDs that have been processed
+        processed_emails: Set of email addresses that have been processed
+    """
+    log_data = {
+        "processed_contact_ids": list(processed_contact_ids),
+        "processed_emails": list(processed_emails),
+        "last_updated": datetime.now().isoformat()
+    }
+    
+    try:
+        with open(PROCESSED_CONTACTS_LOG, "w") as f:
+            json.dump(log_data, f, indent=2)
+        print(f"   📝 Updated processed contacts log: {len(processed_contact_ids)} contacts")
+    except IOError as e:
+        print(f"   ⚠️ Error saving processed contacts log: {e}")
+
+
+def is_contact_already_processed(contact: dict, processed_log: dict) -> bool:
+    """Check if a contact has already been processed.
+    
+    Args:
+        contact: Contact dictionary from HubSpot
+        processed_log: Dictionary from load_processed_contacts_log()
+    
+    Returns:
+        True if contact has been processed, False otherwise
+    """
+    contact_id = contact.get("id")
+    contact_email = contact.get("properties", {}).get("email", "").lower().strip()
+    
+    if contact_id and contact_id in processed_log["processed_contact_ids"]:
+        return True
+    
+    if contact_email and contact_email in processed_log["processed_emails"]:
+        return True
+    
+    return False
+
+
+def get_engagement_score(contact: dict, meeting_count: int = 0) -> int:
+    """Get engagement score for a contact.
+    
+    If USE_HUBSPOT_SCORING is True, uses HubSpot's lead_scoring_engagement property only.
+    Otherwise, calculates a custom engagement score.
+    
+    Args:
+        contact: Contact dictionary from HubSpot
+        meeting_count: Number of meetings associated with the contact
+    
+    Returns:
+        Engagement score as integer (0 if HubSpot scoring is enabled but not available)
+    """
+    props = contact.get("properties", {})
+    
+    # Use HubSpot scoring if enabled (no fallback to custom)
+    if USE_HUBSPOT_SCORING:
+        hubspot_score = props.get("lead_scoring_engagement")
+        if hubspot_score:
+            try:
+                # Handle both string and numeric values
+                return int(float(str(hubspot_score)))
+            except (ValueError, TypeError):
+                return 0  # Return 0 if conversion fails (don't use custom scoring)
+        return 0  # Return 0 if HubSpot score not available (don't use custom scoring)
+    
+    # Use custom scoring only if HubSpot scoring is disabled
+    return calculate_custom_engagement_score(contact, meeting_count)
+
+
+def calculate_custom_engagement_score(contact: dict, meeting_count: int = 0) -> int:
+    """Calculate custom engagement score for a contact based on HubSpot activity properties.
+    
+    This is used when HubSpot scoring is not available or USE_HUBSPOT_SCORING is False.
     
     Scoring:
     - Email opens: 2 points per open (max 20)
@@ -739,6 +899,13 @@ def calculate_engagement_score(contact: dict, meeting_count: int = 0) -> int:
     - Meetings: 20 points per meeting (max 40)
     
     Total possible: ~145 points
+    
+    Args:
+        contact: Contact dictionary from HubSpot
+        meeting_count: Number of meetings associated with the contact
+    
+    Returns:
+        Custom engagement score as integer
     """
     props = contact.get("properties", {})
     score = 0
@@ -810,12 +977,20 @@ def is_contact_stale(contact: dict, threshold_days: int = STALE_THRESHOLD_DAYS) 
 def passes_filters(contact: dict, company: Optional[dict]) -> tuple[bool, str]:
     """Check if a contact passes all configured filters.
     
+    All filters are optional except lead_scoring_threshold which must exist when USE_HUBSPOT_SCORING is True.
+    
     Returns (passes, reason) tuple.
     """
     props = contact.get("properties", {})
     company_props = company.get("properties", {}) if company else {}
     
-    # Filter: Employee size
+    # Required filter: lead_scoring_threshold must exist (only if USE_HUBSPOT_SCORING is true)
+    if USE_HUBSPOT_SCORING:
+        lead_scoring_threshold = props.get("lead_scoring_threshold", "")
+        if not lead_scoring_threshold:
+            return False, "No lead_scoring_threshold property (required when USE_HUBSPOT_SCORING=true)"
+    
+    # Optional filter: Employee size
     if MIN_EMPLOYEE_SIZE > 0:
         employee_count = company_props.get("numberofemployees")
         if employee_count:
@@ -825,41 +1000,82 @@ def passes_filters(contact: dict, company: Optional[dict]) -> tuple[bool, str]:
                     return False, f"Company size ({emp_count}) below minimum ({MIN_EMPLOYEE_SIZE})"
             except (ValueError, TypeError):
                 pass
-        else:
-            # No employee count data - skip this contact
-            return False, "No company employee count data"
     
-    # Filter: Industry
+    # Optional filter: Industry
     if TARGET_INDUSTRIES:
         company_industry = company_props.get("industry", "")
-        if not company_industry or company_industry not in TARGET_INDUSTRIES:
+        if company_industry and company_industry not in TARGET_INDUSTRIES:
             return False, f"Industry '{company_industry}' not in target list"
     
-    # Filter: Country
+    # Optional filter: Country
     if TARGET_COUNTRIES:
         contact_country = props.get("country", "")
         company_country = company_props.get("country", "")
         country = contact_country or company_country
-        if not country or country not in TARGET_COUNTRIES:
+        if country and country not in TARGET_COUNTRIES:
             return False, f"Country '{country}' not in target list"
     
-    # Filter: Job title keywords
+    # Optional filter: Job title keywords
     if TARGET_JOB_TITLES:
         job_title = props.get("jobtitle", "")
-        if not job_title:
-            return False, "No job title"
-        
-        title_lower = job_title.lower()
-        if not any(keyword.lower() in title_lower for keyword in TARGET_JOB_TITLES):
-            return False, f"Job title '{job_title}' doesn't match target keywords"
+        if job_title:
+            title_lower = job_title.lower()
+            if not any(keyword.lower() in title_lower for keyword in TARGET_JOB_TITLES):
+                return False, f"Job title '{job_title}' doesn't match target keywords"
     
-    # Filter: Lifecycle stage
+    # Optional filter: Lifecycle stage
     if TARGET_LIFECYCLE_STAGES:
         lifecycle_stage = props.get("lifecyclestage", "").lower()
-        if not lifecycle_stage or lifecycle_stage not in TARGET_LIFECYCLE_STAGES:
+        if lifecycle_stage and lifecycle_stage not in TARGET_LIFECYCLE_STAGES:
             return False, f"Lifecycle stage '{lifecycle_stage}' not in target list"
     
     return True, "Passed all filters"
+
+
+def format_previous_emails_context(emails: list[dict], max_body_chars: int = 400) -> str:
+    """Format HubSpot email objects into a readable context string (newest first).
+    
+    Each email has properties: hs_email_subject, hs_email_direction, hs_timestamp,
+    hs_email_text, hs_createdate.
+    """
+    if not emails:
+        return "No previous emails found for this contact."
+    
+    # Sort by timestamp descending (most recent first). HubSpot timestamps are often in ms.
+    def _ts(e: dict) -> float:
+        props = e.get("properties", {})
+        ts = props.get("hs_timestamp") or props.get("hs_createdate")
+        if ts is None:
+            return 0.0
+        try:
+            t = float(ts)
+            return t if t > 1e12 else t * 1000  # treat as ms
+        except (TypeError, ValueError):
+            return 0.0
+    
+    sorted_emails = sorted(emails, key=_ts, reverse=True)
+    lines = []
+    for e in sorted_emails[:15]:  # cap at 15 most recent
+        props = e.get("properties", {})
+        direction = (props.get("hs_email_direction") or "UNKNOWN").replace("_", " ").title()
+        subject = (props.get("hs_email_subject") or "(No subject)").strip()
+        body = (props.get("hs_email_text") or "").strip()
+        if body and len(body) > max_body_chars:
+            body = body[:max_body_chars] + "..."
+        ts = props.get("hs_timestamp") or props.get("hs_createdate")
+        date_str = "Unknown date"
+        if ts:
+            try:
+                t = float(ts)
+                if t > 1e12:
+                    t = t / 1000
+                date_str = datetime.fromtimestamp(t).strftime("%Y-%m-%d %H:%M")
+            except (TypeError, ValueError, OSError):
+                date_str = str(ts)
+        lines.append(f"[{date_str}] {direction}\nSubject: {subject}\n{body or '(No body)'}")
+        lines.append("")  # blank line between emails
+    
+    return "\n".join(lines).strip()
 
 
 def generate_outreach_email(client: anthropic.Anthropic, lead_context: dict) -> dict:
@@ -901,6 +1117,10 @@ You are an AI sales assistant for Adopt AI, specializing in generating personali
 **Recent Notes:**
 {lead_context.get('notes', 'No notes available.')}
 
+**Previous Emails (from HubSpot):**
+Use this thread history to avoid repeating ourselves and to reference what was already discussed. If this is a re-engagement, acknowledge prior contact and build on it.
+{lead_context.get('previous_emails_context', 'No previous emails found for this contact.')}
+
 ## Adopt AI Knowledge Base (Relevant Context)
 
 The following content was retrieved from our knowledge base based on this lead's industry, persona, and company profile. Use this to craft a more personalized and relevant email:
@@ -911,27 +1131,30 @@ The following content was retrieved from our knowledge base based on this lead's
 
 ### Step 1: Analyze the Context
 
-From the engagement signals, Apollo data, Slack discussions, and call transcripts, identify:
+From the engagement signals, Apollo data, Slack discussions, call transcripts, and previous emails, identify:
 1. **Interest Indicators**: What has this lead engaged with? What are they interested in?
 2. **Company Context**: What does Apollo tell us about their company, tech stack, or hiring signals?
 3. **Internal Intelligence**: What do we know from Slack or previous calls?
-4. **Relevant Angle**: What capability or use case would resonate most?
+4. **Email Thread**: If there are previous emails, what was said? What should we reference or avoid repeating? Is this a follow-up or net-new angle?
+5. **Relevant Angle**: What capability or use case would resonate most?
+6. **Lead Source**: Where did this lead find Adopt AI? (LinkedIn, website, conference, etc.)
 
 ### Step 2: Generate the Email
 
-**Email Structure (150-200 words MAX):**
-1. **Subject Line**: Reference their engagement or a specific interest
-2. **Opening**: Acknowledge their engagement naturally ("I noticed you've been exploring...")
-3. **Value Hook**: Connect their apparent interest to a specific capability or outcome
-4. **Social Proof (optional)**: Brief mention of similar company or use case
-5. **Simple CTA**: One clear, low-friction ask
+**Email Structure (80-120 words MAX):**
+1. **Subject Line**: Reference their engagement, a specific interest, or the previous thread (e.g. "Re: ..." if following up).
+2. **Opening**: Acknowledge their engagement or prior conversation naturally. If they replied before, reference it; if not, "I noticed you've been exploring..." style is fine.
+3. **Value Hook**: Connect their apparent interest (or what they said in prior emails) to a specific capability or outcome.
+4. **Social Proof (optional)**: Brief mention of similar company or use case.
+5. **Simple CTA**: One clear, low-friction ask. Do not repeat CTAs or offers already made in previous emails.
 
 **Tone Guidelines:**
 - Professional but warm
 - Show you've noticed their specific engagement
 - Focus on THEIR potential use case, not our features
 - Concise and respectful of their time
-- No aggressive sales language
+- Use Poke the bear style of little bit aggressive sales language
+- Don't use long sentences, use short sentences and paragraphs.
 
 ## Response Format
 
@@ -943,14 +1166,13 @@ Respond with JSON in this exact format:
         "recommended_angle": "The approach you're taking and why"
     }},
     "subject": "Email subject line",
-    "body": "The email body (150-200 words max)",
-    "talking_points": ["Point if they respond", "How to handle likely questions"],
+    "body": "The email body (80-120 words max)",
     "flags": ["Any missing info or recommendations"]
 }}
 """
 
     response = client.messages.create(
-        model="claude-sonnet-4-5-20250929",
+        model="claude-opus-4-6",
         max_tokens=2000,
         messages=[{"role": "user", "content": prompt}]
     )
@@ -975,47 +1197,220 @@ Respond with JSON in this exact format:
             },
             "subject": "Let's connect",
             "body": response_text,
-            "talking_points": [],
             "flags": ["Failed to parse structured response"]
         }
 
 
-def format_lead_digest_html(leads: list[dict]) -> str:
-    """Format all leads into an HTML digest email."""
+def generate_linkedin_connection_note(client: anthropic.Anthropic, lead_context: dict) -> str:
+    """Generate a short LinkedIn connection request note (max 300 characters) for a lead."""
+
+    prompt = f"""## Role & Purpose
+
+You are an AI sales assistant for Adopt AI. Generate a single LinkedIn connection note that will be sent when we send this person a connection request. LinkedIn limits connection notes to 300 characters.
+
+## Lead Context
+
+**Contact:** {lead_context['contact_name']} – {lead_context['contact_title']} at {lead_context['company_name']}
+**Company:** {lead_context['company_industry']}, {lead_context['company_size']} employees
+
+**Brief context (use for personalization):**
+- Apollo: {lead_context.get('apollo_context', 'No Apollo data')[:400]}
+- Recommended angle from our analysis: {lead_context.get('analysis', {}).get('recommended_angle', 'N/A') if isinstance(lead_context.get('analysis'), dict) else 'N/A'}
+
+## Requirements
+
+- Maximum 300 characters (LinkedIn hard limit). Count carefully.
+- Personal and relevant to their role/company – reference something specific.
+- No hard sell. Goal is to get them to accept the connection.
+- One or two short sentences. Natural, conversational tone.
+- Do not include greetings like "Hi [Name]" if it wastes space; we can add that when sending. Optional: you may start with first name only.
+
+## Response Format
+
+Respond with JSON only:
+{{"note": "Your connection note here, under 300 characters."}}
+"""
+
+    try:
+        response = client.messages.create(
+            model="claude-opus-4-6",
+            max_tokens=1000,
+            messages=[{"role": "user", "content": prompt}]
+        )
+        response_text = response.content[0].text.strip()
+        if "```json" in response_text:
+            json_str = response_text.split("```json")[1].split("```")[0].strip()
+        elif "```" in response_text:
+            json_str = response_text.split("```")[1].split("```")[0].strip()
+        else:
+            json_str = response_text
+        data = json.loads(json_str)
+        note = (data.get("note") or response_text or "").strip()
+        return note[:300]
+    except Exception:
+        return ""
+
+
+def format_lead_digest_html(deepak_leads: list[dict], marshal_leads: list[dict]) -> str:
+    """Format leads into an HTML digest email with two sections (one for each person).
+    
+    Args:
+        deepak_leads: List of leads for deepak@adopt.ai
+        marshal_leads: List of leads for marshal@adopt.ai
+    """
     
     date_str = datetime.now().strftime("%B %d, %Y at %I:%M %p")
-    count = len(leads)
+    total_count = len(deepak_leads) + len(marshal_leads)
+    
+    def format_lead_card(lead: dict, index: int) -> str:
+        """Format a single lead card."""
+        # Build Apollo insights HTML
+        apollo_html = ""
+        apollo_data = lead.get("apollo_enrichment", {})
+        if apollo_data.get("found"):
+            company_data = apollo_data.get("company", {})
+            contact_data = apollo_data.get("contact", {})
+            intent_data = apollo_data.get("intent_signals", {})
+            
+            apollo_items = []
+            if company_data.get("funding_stage"):
+                apollo_items.append(f"<div class='apollo-item'><strong>Funding:</strong> {company_data['funding_stage']}</div>")
+            if company_data.get("tech_stack"):
+                tech_preview = ", ".join(company_data["tech_stack"][:5])
+                apollo_items.append(f"<div class='apollo-item'><strong>Tech Stack:</strong> {tech_preview}</div>")
+            if contact_data.get("seniority"):
+                apollo_items.append(f"<div class='apollo-item'><strong>Seniority:</strong> {contact_data['seniority']}</div>")
+            if intent_data.get("hiring_signal"):
+                apollo_items.append(f"<div class='apollo-item'><strong>🔥 Hiring Signal:</strong> Currently hiring</div>")
+            
+            if apollo_items:
+                apollo_html = f"""
+                <div class="apollo-insights">
+                    <h4>🔍 Apollo Insights</h4>
+                    {"".join(apollo_items)}
+                </div>
+"""
+        
+        # Build analysis HTML
+        analysis_html = ""
+        analysis = lead.get("analysis", {})
+        if analysis:
+            analysis_html = f"""
+                <div class="analysis">
+                    <h4>🧠 AI Analysis</h4>
+                    <div class="analysis-item"><strong>Engagement:</strong> {analysis.get('engagement_summary', 'N/A')}</div>
+                    <div class="analysis-item"><strong>Company Insights:</strong> {analysis.get('company_insights', 'N/A')}</div>
+                    <div class="analysis-item"><strong>Recommended Angle:</strong> {analysis.get('recommended_angle', 'N/A')}</div>
+                </div>
+"""
+        
+        # Build flags HTML
+        flags_html = ""
+        flags = lead.get("flags", [])
+        if flags:
+            flag_items = "".join(f"<li>{f}</li>" for f in flags)
+            flags_html = f"""
+                <div class="flags">
+                    <h4>⚠️ Flags</h4>
+                    <ul>{flag_items}</ul>
+                </div>
+"""
+        
+        # Build lead scoring HTML
+        lead_scoring_html = ""
+        threshold = lead.get("lead_scoring_threshold", "N/A")
+        total_score = lead.get("lead_scoring_total", "N/A")
+        fit_score = lead.get("lead_scoring_fit", "N/A")
+        engagement_score = lead.get("lead_scoring_engagement", "N/A")
+        
+        # Determine threshold color based on priority
+        threshold_colors = {
+            "A1": "#d32f2f",  # Red - hottest
+            "A2": "#f57c00",  # Orange
+            "B1": "#f57c00",  # Orange
+            "A3": "#fbc02d",  # Yellow
+            "B2": "#689f38",  # Light green
+            "C1": "#1976d2",  # Blue
+            "B3": "#616161",  # Grey
+            "C2": "#616161",  # Grey
+            "C3": "#616161",  # Grey
+        }
+        threshold_color = threshold_colors.get(threshold, "#616161")
+        
+        lead_scoring_html = f"""
+                <div class="lead-scoring" style="background: #f3e5f5; border-radius: 8px; padding: 15px; margin: 15px 0; border-left: 4px solid {threshold_color};">
+                    <h4 style="margin: 0 0 10px 0; color: {threshold_color}; font-size: 13px; text-transform: uppercase;">🎯 Lead Scoring</h4>
+                    <div style="display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 10px;">
+                        <div style="background: white; padding: 10px; border-radius: 6px;">
+                            <div style="font-size: 11px; color: #666; margin-bottom: 5px;">Threshold</div>
+                            <div style="font-size: 18px; font-weight: bold; color: {threshold_color};">{threshold}</div>
+                        </div>
+                        <div style="background: white; padding: 10px; border-radius: 6px;">
+                            <div style="font-size: 11px; color: #666; margin-bottom: 5px;">Total Score</div>
+                            <div style="font-size: 18px; font-weight: bold; color: #333;">{total_score}</div>
+                        </div>
+                        <div style="background: white; padding: 10px; border-radius: 6px;">
+                            <div style="font-size: 11px; color: #666; margin-bottom: 5px;">Fit Score</div>
+                            <div style="font-size: 18px; font-weight: bold; color: #333;">{fit_score}</div>
+                        </div>
+                        <div style="background: white; padding: 10px; border-radius: 6px;">
+                            <div style="font-size: 11px; color: #666; margin-bottom: 5px;">Engagement Score</div>
+                            <div style="font-size: 18px; font-weight: bold; color: #333;">{engagement_score}</div>
+                        </div>
+                    </div>
+                </div>
+"""
+        
+        return f"""
+    <div class="lead-card">
+        <div class="lead-header">
+            <span class="lead-name">#{index} {lead['contact_name']}</span>
+            <span class="engagement-score">Score: {lead['engagement_score']}</span>
+        </div>
+        <div class="lead-meta">
+            <strong>{lead['contact_title']}</strong> at <strong>{lead['company_name']}</strong><br>
+            {lead['contact_email']} • {lead['company_industry']} • {lead['company_size']} employees<br>
+            Last activity: {lead['days_since_activity']} days ago{f" • <a href='{lead['contact_linkedin_url']}' style='color: #0077b5;'>LinkedIn</a>" if lead.get('contact_linkedin_url') else ""}
+        </div>
+        {lead_scoring_html}
+        {apollo_html}
+        {analysis_html}
+        {flags_html}
+        <div class="email-preview">
+            <div class="email-subject">📝 Subject: {html_module.escape(lead['email_subject'])}</div>
+            <div class="email-body">{html_module.escape(lead['email_body'])}</div>
+        </div>
+        {f'<div class="linkedin-note"><h4>🔗 LinkedIn connection note</h4><p>{html_module.escape(lead.get("linkedin_connection_note", ""))}</p><span class="linkedin-note-hint">Use when sending connection request (max 300 chars)</span></div>' if lead.get("linkedin_connection_note") else ""}
+    </div>
+"""
     
     html = f"""
 <!DOCTYPE html>
 <html>
 <head>
     <style>
-        body {{ font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; line-height: 1.6; color: #333; max-width: 800px; margin: 0 auto; padding: 20px; }}
+        body {{ font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; line-height: 1.6; color: #333; max-width: 900px; margin: 0 auto; padding: 20px; }}
         .header {{ background: linear-gradient(135deg, #11998e 0%, #38ef7d 100%); color: white; padding: 30px; border-radius: 10px; margin-bottom: 30px; }}
         .header h1 {{ margin: 0; font-size: 24px; }}
         .header p {{ margin: 10px 0 0 0; opacity: 0.9; }}
+        .section-header {{ background: linear-gradient(135deg, #667eea 0%, #764ba2 100%); color: white; padding: 20px; border-radius: 10px; margin: 30px 0 20px 0; }}
+        .section-header h2 {{ margin: 0; font-size: 20px; }}
+        .section-header p {{ margin: 10px 0 0 0; opacity: 0.9; font-size: 14px; }}
         .lead-card {{ background: #f8f9fa; border-radius: 10px; padding: 25px; margin-bottom: 25px; border-left: 4px solid #11998e; }}
         .lead-header {{ display: flex; justify-content: space-between; align-items: center; margin-bottom: 15px; flex-wrap: wrap; gap: 10px; }}
         .lead-name {{ font-size: 18px; font-weight: 600; color: #333; }}
         .engagement-score {{ background: #11998e; color: white; padding: 4px 12px; border-radius: 20px; font-size: 12px; }}
         .lead-meta {{ color: #666; font-size: 14px; margin-bottom: 15px; }}
-        .engagement-signals {{ background: #e8f5e9; border-radius: 8px; padding: 15px; margin: 15px 0; }}
-        .engagement-signals h4 {{ margin: 0 0 10px 0; color: #2e7d32; font-size: 13px; text-transform: uppercase; }}
-        .signal-grid {{ display: grid; grid-template-columns: repeat(auto-fit, minmax(120px, 1fr)); gap: 10px; }}
-        .signal {{ text-align: center; padding: 8px; background: white; border-radius: 6px; }}
-        .signal-value {{ font-size: 20px; font-weight: bold; color: #11998e; }}
-        .signal-label {{ font-size: 11px; color: #666; }}
         .apollo-insights {{ background: #e3f2fd; border-radius: 8px; padding: 15px; margin: 15px 0; border-left: 3px solid #1976d2; }}
         .apollo-insights h4 {{ margin: 0 0 10px 0; color: #1976d2; font-size: 13px; text-transform: uppercase; }}
         .apollo-item {{ font-size: 13px; color: #555; margin-bottom: 5px; }}
         .email-preview {{ background: white; border-radius: 8px; padding: 20px; margin-top: 15px; }}
         .email-subject {{ font-weight: 600; color: #333; margin-bottom: 10px; border-bottom: 1px solid #eee; padding-bottom: 10px; }}
         .email-body {{ white-space: pre-wrap; color: #444; }}
-        .talking-points {{ margin-top: 15px; padding-top: 15px; border-top: 1px dashed #ddd; }}
-        .talking-points h4 {{ margin: 0 0 10px 0; color: #666; font-size: 13px; text-transform: uppercase; }}
-        .talking-points ul {{ margin: 0; padding-left: 20px; }}
-        .talking-points li {{ color: #555; margin-bottom: 5px; }}
+        .linkedin-note {{ background: #e8f4f8; border-radius: 8px; padding: 15px; margin-top: 15px; border-left: 3px solid #0077b5; }}
+        .linkedin-note h4 {{ margin: 0 0 8px 0; color: #0077b5; font-size: 13px; text-transform: uppercase; }}
+        .linkedin-note p {{ margin: 0; color: #333; font-size: 14px; white-space: pre-wrap; }}
+        .linkedin-note-hint {{ display: block; font-size: 11px; color: #666; margin-top: 8px; }}
         .analysis {{ background: #fff3e0; border-radius: 8px; padding: 15px; margin: 15px 0; border-left: 3px solid #ff9800; }}
         .analysis h4 {{ margin: 0 0 10px 0; color: #e65100; font-size: 13px; text-transform: uppercase; }}
         .analysis-item {{ font-size: 13px; color: #555; margin-bottom: 8px; }}
@@ -1037,132 +1432,56 @@ def format_lead_digest_html(leads: list[dict]) -> str:
         <p>High-Engagement Stale Leads - Generated on {date_str}</p>
         <div class="stats">
             <div class="stat">
-                <div class="stat-value">{count}</div>
-                <div class="stat-label">Top Leads Found</div>
+                <div class="stat-value">{total_count}</div>
+                <div class="stat-label">Total Leads</div>
+            </div>
+            <div class="stat">
+                <div class="stat-value">{len(deepak_leads)}</div>
+                <div class="stat-label">Deepak's Leads</div>
+            </div>
+            <div class="stat">
+                <div class="stat-value">{len(marshal_leads)}</div>
+                <div class="stat-label">Marshal's Leads</div>
             </div>
         </div>
     </div>
 """
     
-    if not leads:
+    # Deepak's section
+    html += f"""
+    <div class="section-header">
+        <h2>👤 Leads for Deepak (deepak@adopt.ai)</h2>
+        <p>{len(deepak_leads)} leads assigned</p>
+    </div>
+"""
+    
+    if not deepak_leads:
         html += """
     <div class="no-leads">
-        <h2>No leads found</h2>
-        <p>No high-engagement stale leads matching your criteria were found today.</p>
+        <p>No leads assigned to Deepak.</p>
     </div>
 """
     else:
-        for i, lead in enumerate(leads, 1):
-            # Build engagement signals HTML
-            signals_html = f"""
-            <div class="engagement-signals">
-                <h4>📊 Engagement Signals</h4>
-                <div class="signal-grid">
-                    <div class="signal">
-                        <div class="signal-value">{lead.get('email_opens', 0)}</div>
-                        <div class="signal-label">Email Opens</div>
-                    </div>
-                    <div class="signal">
-                        <div class="signal-value">{lead.get('email_clicks', 0)}</div>
-                        <div class="signal-label">Email Clicks</div>
-                    </div>
-                    <div class="signal">
-                        <div class="signal-value">{lead.get('page_views', 0)}</div>
-                        <div class="signal-label">Page Views</div>
-                    </div>
-                    <div class="signal">
-                        <div class="signal-value">{lead.get('form_submissions', 0)}</div>
-                        <div class="signal-label">Form Fills</div>
-                    </div>
-                </div>
-            </div>
-"""
-            
-            # Build Apollo insights HTML
-            apollo_html = ""
-            apollo_data = lead.get("apollo_enrichment", {})
-            if apollo_data.get("found"):
-                company_data = apollo_data.get("company", {})
-                contact_data = apollo_data.get("contact", {})
-                intent_data = apollo_data.get("intent_signals", {})
-                
-                apollo_items = []
-                if company_data.get("funding_stage"):
-                    apollo_items.append(f"<div class='apollo-item'><strong>Funding:</strong> {company_data['funding_stage']}</div>")
-                if company_data.get("tech_stack"):
-                    tech_preview = ", ".join(company_data["tech_stack"][:5])
-                    apollo_items.append(f"<div class='apollo-item'><strong>Tech Stack:</strong> {tech_preview}</div>")
-                if contact_data.get("seniority"):
-                    apollo_items.append(f"<div class='apollo-item'><strong>Seniority:</strong> {contact_data['seniority']}</div>")
-                if intent_data.get("hiring_signal"):
-                    apollo_items.append(f"<div class='apollo-item'><strong>🔥 Hiring Signal:</strong> Currently hiring</div>")
-                
-                if apollo_items:
-                    apollo_html = f"""
-                <div class="apollo-insights">
-                    <h4>🔍 Apollo Insights</h4>
-                    {"".join(apollo_items)}
-                </div>
-"""
-            
-            # Build analysis HTML
-            analysis_html = ""
-            analysis = lead.get("analysis", {})
-            if analysis:
-                analysis_html = f"""
-                <div class="analysis">
-                    <h4>🧠 AI Analysis</h4>
-                    <div class="analysis-item"><strong>Engagement:</strong> {analysis.get('engagement_summary', 'N/A')}</div>
-                    <div class="analysis-item"><strong>Company Insights:</strong> {analysis.get('company_insights', 'N/A')}</div>
-                    <div class="analysis-item"><strong>Recommended Angle:</strong> {analysis.get('recommended_angle', 'N/A')}</div>
-                </div>
-"""
-            
-            # Build flags HTML
-            flags_html = ""
-            flags = lead.get("flags", [])
-            if flags:
-                flag_items = "".join(f"<li>{f}</li>" for f in flags)
-                flags_html = f"""
-                <div class="flags">
-                    <h4>⚠️ Flags</h4>
-                    <ul>{flag_items}</ul>
-                </div>
-"""
-            
-            # Build talking points HTML
-            talking_points_html = ""
-            if lead.get("talking_points"):
-                points = "".join(f"<li>{p}</li>" for p in lead["talking_points"])
-                talking_points_html = f"""
-                <div class="talking-points">
-                    <h4>💡 Talking Points</h4>
-                    <ul>{points}</ul>
-                </div>
-"""
-            
-            html += f"""
-    <div class="lead-card">
-        <div class="lead-header">
-            <span class="lead-name">#{i} {lead['contact_name']}</span>
-            <span class="engagement-score">Score: {lead['engagement_score']}</span>
-        </div>
-        <div class="lead-meta">
-            <strong>{lead['contact_title']}</strong> at <strong>{lead['company_name']}</strong><br>
-            {lead['contact_email']} • {lead['company_industry']} • {lead['company_size']} employees<br>
-            Last activity: {lead['days_since_activity']} days ago{f" • <a href='{lead['contact_linkedin_url']}' style='color: #0077b5;'>LinkedIn</a>" if lead.get('contact_linkedin_url') else ""}
-        </div>
-        {signals_html}
-        {apollo_html}
-        {analysis_html}
-        {flags_html}
-        <div class="email-preview">
-            <div class="email-subject">📝 Subject: {lead['email_subject']}</div>
-            <div class="email-body">{lead['email_body']}</div>
-            {talking_points_html}
-        </div>
+        for i, lead in enumerate(deepak_leads, 1):
+            html += format_lead_card(lead, i)
+    
+    # Marshal's section
+    html += f"""
+    <div class="section-header">
+        <h2>👤 Leads for Marshal (marshal@adopt.ai)</h2>
+        <p>{len(marshal_leads)} leads assigned</p>
     </div>
 """
+    
+    if not marshal_leads:
+        html += """
+    <div class="no-leads">
+        <p>No leads assigned to Marshal.</p>
+    </div>
+"""
+    else:
+        for i, lead in enumerate(marshal_leads, 1):
+            html += format_lead_card(lead, i)
     
     html += """
     <div class="footer">
@@ -1247,23 +1566,36 @@ def main():
         print("ℹ️ Knowledge base disabled (run 'python index_knowledge_base.py' to enable)")
         knowledge_base = None
     
-    # Calculate the stale date cutoff
-    stale_cutoff = datetime.now() - timedelta(days=STALE_THRESHOLD_DAYS)
-    stale_cutoff_ms = int(stale_cutoff.timestamp() * 1000)  # HubSpot uses milliseconds
+    # Calculate the stale date cutoff (if STALE_THRESHOLD_DAYS is set)
+    stale_cutoff_ms = None
+    if STALE_THRESHOLD_DAYS and STALE_THRESHOLD_DAYS > 0:
+        stale_cutoff = datetime.now() - timedelta(days=STALE_THRESHOLD_DAYS)
+        stale_cutoff_ms = int(stale_cutoff.timestamp() * 1000)  # HubSpot uses milliseconds
     
     # Print filter configuration
     print(f"\n📋 Filter Configuration:")
-    print(f"   - Marketing Contacts only: Yes")
-    print(f"   - Min employee size: {MIN_EMPLOYEE_SIZE}")
-    print(f"   - Stale threshold: {STALE_THRESHOLD_DAYS} days (before {stale_cutoff.strftime('%Y-%m-%d')})")
-    print(f"   - Target industries: {TARGET_INDUSTRIES if TARGET_INDUSTRIES else 'All'}")
-    print(f"   - Target countries: {TARGET_COUNTRIES if TARGET_COUNTRIES else 'All'}")
-    print(f"   - Target job titles: {TARGET_JOB_TITLES if TARGET_JOB_TITLES else 'All'}")
-    print(f"   - Target lifecycle stages: {TARGET_LIFECYCLE_STAGES if TARGET_LIFECYCLE_STAGES else 'All'}")
+    print(f"   - Required: lead_scoring_threshold must exist")
+    print(f"   - Engagement scoring: {'HubSpot (lead_scoring_total)' if USE_HUBSPOT_SCORING else 'Custom (calculated)'}")
+    print(f"   - Marketing Contacts only: {'Yes (if REQUIRE_MARKETING_CONTACT=true)' if os.getenv('REQUIRE_MARKETING_CONTACT', 'false').lower() == 'true' else 'Optional'}")
+    print(f"   - Min employee size: {MIN_EMPLOYEE_SIZE if MIN_EMPLOYEE_SIZE > 0 else 'Not set (optional)'}")
+    
+    # Format stale threshold message
+    if STALE_THRESHOLD_DAYS and STALE_THRESHOLD_DAYS > 0:
+        stale_cutoff = datetime.now() - timedelta(days=STALE_THRESHOLD_DAYS)
+        stale_msg = f"{STALE_THRESHOLD_DAYS} days (before {stale_cutoff.strftime('%Y-%m-%d')})"
+    else:
+        stale_msg = "Not set (optional)"
+    print(f"   - Stale threshold: {stale_msg}")
+    print(f"   - Target industries: {TARGET_INDUSTRIES if TARGET_INDUSTRIES else 'All (optional)'}")
+    print(f"   - Target countries: {TARGET_COUNTRIES if TARGET_COUNTRIES else 'All (optional)'}")
+    print(f"   - Target job titles: {TARGET_JOB_TITLES if TARGET_JOB_TITLES else 'All (optional)'}")
+    print(f"   - Target lifecycle stages: {TARGET_LIFECYCLE_STAGES if TARGET_LIFECYCLE_STAGES else 'All (optional)'}")
     
     # Step 1: Search for contacts using HubSpot filters
-    # Filters: Marketing Contact = Yes, Employee Size >= 200, Last Activity > 14 days ago
-    print(f"\n📊 Searching HubSpot for stale Marketing Contacts (employee size >= {MIN_EMPLOYEE_SIZE})...")
+    if USE_HUBSPOT_SCORING:
+        print(f"\n📊 Searching HubSpot for contacts with lead_scoring_threshold...")
+    else:
+        print(f"\n📊 Searching HubSpot for contacts...")
     
     contact_properties = [
         "email", "firstname", "lastname", "jobtitle", "company", "country",
@@ -1272,41 +1604,108 @@ def main():
         "hs_email_click_count", "hs_sales_email_last_replied",
         "hs_analytics_num_page_views", "num_conversion_events",
         "associatedcompanyid", "hs_marketable_status", "employee_size",
-        "hs_linkedin_url"
+        "hs_linkedin_url", "lead_scoring_threshold", "lead_scoring_total",
+        "lead_scoring_fit", "lead_scoring_engagement"
     ]
     
-    # Build HubSpot search filters - all in one filter group (AND logic)
-    hubspot_filters = [
-        # Marketing Contact = Yes
-        {
+    # Build HubSpot search filters
+    hubspot_filters = []
+    
+    # Required filter: lead_scoring_threshold must exist (only if USE_HUBSPOT_SCORING is true)
+    if USE_HUBSPOT_SCORING:
+        hubspot_filters.append({
+            "propertyName": "lead_scoring_threshold",
+            "operator": "HAS_PROPERTY"
+        })
+    
+    # Optional filter: Marketing Contact = Yes (if enabled)
+    if os.getenv("REQUIRE_MARKETING_CONTACT", "false").lower() == "true":
+        hubspot_filters.append({
             "propertyName": "hs_marketable_status",
             "operator": "EQ",
             "value": "true"
-        },
-        # Employee Size >= MIN_EMPLOYEE_SIZE (on contact object)
-        {
+        })
+    
+    # Optional filter: Employee Size >= MIN_EMPLOYEE_SIZE (if set)
+    if MIN_EMPLOYEE_SIZE > 0:
+        hubspot_filters.append({
             "propertyName": "employee_size",
             "operator": "GTE",
             "value": str(MIN_EMPLOYEE_SIZE)
-        },
-        # Last activity date is before the stale cutoff (i.e., older than 14 days)
-        {
+        })
+    
+    # Optional filter: Stale threshold (if set)
+    if STALE_THRESHOLD_DAYS and STALE_THRESHOLD_DAYS > 0:
+        hubspot_filters.append({
             "propertyName": "notes_last_updated",
             "operator": "LT",
             "value": str(stale_cutoff_ms)
-        }
-    ]
+        })
     
     contacts = hubspot.search_contacts(filters=hubspot_filters, properties=contact_properties)
     print(f"   Found {len(contacts)} contacts matching HubSpot filters")
     
-    # Step 2: Take first 10 contacts for processing
-    # (HubSpot already filtered by Marketing Contact, Employee Size, and Stale Date)
-    contacts_to_process = contacts[:TOP_LEADS_COUNT]
-    print(f"   Processing first {len(contacts_to_process)} contacts...")
+    # Load processed contacts log so we only ever pick the NEXT TOP_LEADS_COUNT (exclude anyone already run in a previous workflow)
+    print(f"\n📋 Loading processed contacts log...")
+    processed_log = load_processed_contacts_log()
+    if processed_log["last_updated"]:
+        print(f"   Log last updated: {processed_log['last_updated']}")
+        print(f"   Already processed: {len(processed_log['processed_contact_ids'])} contacts")
     
-    # Step 3: Enrich the selected contacts with company data and calculate engagement scores
-    print(f"\n🔍 Enriching contacts and calculating engagement scores...")
+    # Filter out already-processed contacts
+    unprocessed_contacts = []
+    skipped_count = 0
+    for contact in contacts:
+        if is_contact_already_processed(contact, processed_log):
+            skipped_count += 1
+            continue
+        unprocessed_contacts.append(contact)
+    
+    already_processed_count = len(processed_log["processed_contact_ids"])
+    print(f"   Skipped {skipped_count} already-processed contacts")
+    print(f"   {len(unprocessed_contacts)} unprocessed contacts remaining")
+    
+    if not unprocessed_contacts:
+        print("\n⚠️ No new contacts to process. All contacts have already been processed.")
+        return []
+    
+    # Step 2: Sort unprocessed contacts by priority, then pick the NEXT TOP_LEADS_COUNT (so we never re-run the same contacts)
+    # This is especially important when USE_HUBSPOT_SCORING is enabled - we use scores already in HubSpot
+    print(f"\n📊 Sorting unprocessed contacts by priority (using HubSpot scoring data)...")
+    
+    if USE_HUBSPOT_SCORING:
+        # When HubSpot scoring is enabled, sort using data already in HubSpot (no API calls)
+        def sort_contacts_by_hubspot_priority(contact):
+            props = contact.get("properties", {})
+            threshold = props.get("lead_scoring_threshold", "")
+            priority = get_lead_scoring_priority(threshold)
+            # Get total lead score from HubSpot (already available, no calculation needed)
+            total_score = 0
+            hubspot_total_score = props.get("lead_scoring_total")
+            if hubspot_total_score:
+                try:
+                    total_score = int(float(str(hubspot_total_score)))
+                except (ValueError, TypeError):
+                    pass
+            # Lower priority number = higher priority, so sort by priority ascending, then total score descending
+            return (priority, -total_score)
+        
+        # Sort all unprocessed contacts by HubSpot priority
+        unprocessed_contacts.sort(key=sort_contacts_by_hubspot_priority)
+        
+        print(f"   Sorted {len(unprocessed_contacts)} unprocessed contacts by lead_scoring_threshold priority (A1→C3)")
+        
+        # Pick the NEXT TOP_LEADS_COUNT: first TOP_LEADS_COUNT from the sorted unprocessed list (already-processed are excluded above)
+        contacts_to_process = unprocessed_contacts[:TOP_LEADS_COUNT]
+        print(f"   Selected the next {TOP_LEADS_COUNT} contacts for this run (already in log: {already_processed_count} → after this run: {already_processed_count + len(contacts_to_process)})")
+    else:
+        # When custom scoring is used, we need to calculate scores first
+        # But we can still do a quick filter before full enrichment
+        contacts_to_process = unprocessed_contacts[:100]  # Process more for custom scoring to find best TOP_LEADS_COUNT
+        print(f"   Will process up to {len(contacts_to_process)} contacts for custom scoring")
+    
+    # Step 3: Enrich ONLY the selected contacts with company data and get engagement scores
+    print(f"\n🔍 Enriching {len(contacts_to_process)} selected contacts...")
     
     qualified_leads = []
     
@@ -1327,12 +1726,25 @@ def main():
             print(f"      ⚠️ Skipped: {reason}")
             continue
         
-        # Get meeting count for engagement scoring
-        meetings = hubspot.get_contact_meeting_associations(contact_id)
-        meeting_count = len(meetings)
-        
-        # Calculate engagement score
-        engagement_score = calculate_engagement_score(contact, meeting_count)
+        # Get score (from HubSpot total score if enabled, or calculate custom engagement score)
+        if USE_HUBSPOT_SCORING:
+            # Use HubSpot total lead score directly (already in contact properties, no calculation needed)
+            lead_score_total = 0
+            hubspot_total_score = props.get("lead_scoring_total")
+            if hubspot_total_score:
+                try:
+                    lead_score_total = int(float(str(hubspot_total_score)))
+                except (ValueError, TypeError):
+                    lead_score_total = 0
+            # Store in engagement_score field for backward compatibility
+            engagement_score = lead_score_total
+            meeting_count = 0  # Not needed when using HubSpot scoring
+        else:
+            # Get meeting count for custom engagement scoring
+            meetings = hubspot.get_contact_meeting_associations(contact_id)
+            meeting_count = len(meetings)
+            # Calculate custom engagement score
+            engagement_score = get_engagement_score(contact, meeting_count)
         
         # Store qualified lead with all data
         qualified_leads.append({
@@ -1340,7 +1752,7 @@ def main():
             "contact": contact,
             "company": company,
             "engagement_score": engagement_score,
-            "meeting_count": meeting_count,
+            "meeting_count": meeting_count if not USE_HUBSPOT_SCORING else 0,
             "contact_name": contact_name,
             "contact_email": props.get("email", "No email"),
             "contact_title": props.get("jobtitle", "Unknown"),
@@ -1352,23 +1764,101 @@ def main():
             "email_clicks": int(props.get("hs_email_click_count", 0) or 0),
             "page_views": int(props.get("hs_analytics_num_page_views", 0) or 0),
             "form_submissions": int(props.get("num_conversion_events", 0) or 0),
+            "lead_scoring_threshold": props.get("lead_scoring_threshold", "N/A"),
+            "lead_scoring_total": props.get("lead_scoring_total", "N/A"),
+            "lead_scoring_fit": props.get("lead_scoring_fit", "N/A"),
+            "lead_scoring_engagement": props.get("lead_scoring_engagement", "N/A"),
         })
-        print(f"      ✓ Engagement score: {engagement_score}")
+        
+        if USE_HUBSPOT_SCORING:
+            print(f"      ✓ HubSpot Total Lead Score: {engagement_score}")
+        else:
+            print(f"      ✓ Calculated engagement score: {engagement_score}")
     
-    # Sort by engagement score (highest first)
-    qualified_leads.sort(key=lambda x: x["engagement_score"], reverse=True)
-    top_leads = qualified_leads[:TOP_LEADS_COUNT]
+    # Sort qualified leads (if not already sorted by HubSpot priority)
+    if USE_HUBSPOT_SCORING:
+        # Already sorted by HubSpot priority before processing, but re-sort after filtering
+        def sort_key(lead):
+            props = lead.get("contact", {}).get("properties", {})
+            threshold = props.get("lead_scoring_threshold", "")
+            priority = get_lead_scoring_priority(threshold)
+            # Use lead_scoring_total for sorting
+            total_score = 0
+            hubspot_total = props.get("lead_scoring_total")
+            if hubspot_total:
+                try:
+                    total_score = int(float(str(hubspot_total)))
+                except (ValueError, TypeError):
+                    pass
+            return (priority, -total_score)
+        
+        qualified_leads.sort(key=sort_key)
+        
+        # Randomly shuffle leads within the same threshold priority to ensure fair distribution
+        threshold_groups = {}
+        for lead in qualified_leads:
+            props = lead.get("contact", {}).get("properties", {})
+            threshold = props.get("lead_scoring_threshold", "UNKNOWN")
+            if threshold not in threshold_groups:
+                threshold_groups[threshold] = []
+            threshold_groups[threshold].append(lead)
+        
+        # Shuffle within each threshold group
+        for threshold, leads in threshold_groups.items():
+            random.shuffle(leads)
+        
+        # Rebuild maintaining priority order (A1 highest, C3 lowest)
+        qualified_leads = []
+        for threshold in ["A1", "A2", "B1", "A3", "B2", "C1", "B3", "C2", "C3"]:
+            if threshold in threshold_groups:
+                qualified_leads.extend(threshold_groups[threshold])
+    else:
+        # If not using HubSpot scoring, sort by engagement score only
+        qualified_leads.sort(key=lambda x: x.get("engagement_score", 0), reverse=True)
     
-    print(f"\n🏆 {len(top_leads)} leads ready for outreach (sorted by engagement):")
-    for i, lead in enumerate(top_leads, 1):
-        print(f"   {i}. {lead['contact_name']} ({lead['company_name']}) - Score: {lead['engagement_score']}")
+    # Pick top TOP_LEADS_COUNT leads
+    qualified_leads = qualified_leads[:TOP_LEADS_COUNT]
+    
+    print(f"\n🏆 Top {len(qualified_leads)} qualified leads selected:")
+    for i, lead in enumerate(qualified_leads, 1):
+        props = lead.get("contact", {}).get("properties", {})
+        threshold = props.get("lead_scoring_threshold", "N/A")
+        if USE_HUBSPOT_SCORING:
+            total_score = props.get("lead_scoring_total", "N/A")
+            print(f"   {i}. {lead['contact_name']} ({lead['company_name']}) - Threshold: {threshold}, HubSpot Total Lead Score: {total_score}")
+        else:
+            print(f"   {i}. {lead['contact_name']} ({lead['company_name']}) - Custom Score: {lead['engagement_score']}")
+    
+    print(f"\n📊 Top {TOP_LEADS_COUNT} leads selected (sorted by priority A1→C3):")
+    for i, lead in enumerate(qualified_leads, 1):
+        props = lead.get("contact", {}).get("properties", {})
+        threshold = props.get("lead_scoring_threshold", "N/A")
+        print(f"   {i}. {lead['contact_name']} ({lead['company_name']}) - Threshold: {threshold}")
+    
+    # Split leads into two groups: TOP_LEADS_COUNT // 2 for deepak, remaining for marshal
+    # Mark each lead with assignment
+    deepak_count = TOP_LEADS_COUNT // 2
+    for i, lead in enumerate(qualified_leads):
+        if i < deepak_count:
+            lead["assigned_to"] = "deepak"
+        else:
+            lead["assigned_to"] = "marshal"
+    
+    deepak_leads = [lead for lead in qualified_leads[:deepak_count]]
+    marshal_leads = [lead for lead in qualified_leads[deepak_count:TOP_LEADS_COUNT]]
+    
+    print(f"\n📊 Lead Assignment:")
+    print(f"   Deepak: {len(deepak_leads)} leads")
+    print(f"   Marshal: {len(marshal_leads)} leads")
     
     # Step 4: Enrich leads with context and generate emails
     print(f"\n✍️ Enriching leads and generating emails...")
     
+    # Process all qualified leads (both groups, up to TOP_LEADS_COUNT)
+    all_leads_to_process = qualified_leads[:TOP_LEADS_COUNT]
     final_leads = []
     
-    for lead in top_leads:
+    for lead in all_leads_to_process:
         contact_name = lead["contact_name"]
         company_name = lead["company_name"]
         contact_email = lead["contact_email"]
@@ -1433,18 +1923,35 @@ def main():
         
         lead["slack_context"] = slack_context
         
-        # Fireflies context
+        # Fireflies context: search by company name and company domain
         fireflies_context = "Fireflies integration not enabled."
-        if fireflies and company_name and company_name != "Unknown Company":
-            try:
-                transcripts = fireflies.search_transcripts_by_title(company_name, limit=5)
-                if transcripts:
-                    fireflies_context = fireflies.format_fireflies_context(transcripts)
-                    print(f"      📞 Found {len(transcripts)} call transcripts")
-                else:
-                    fireflies_context = "No call transcripts found."
-            except Exception as e:
-                print(f"      ⚠️ Fireflies error: {e}")
+        company_obj = lead.get("company")
+        company_props = company_obj.get("properties", {}) if company_obj else {}
+        apollo_company = (lead.get("apollo_enrichment") or {}).get("company", {})
+        company_domain = extract_domain(
+            company_props.get("website") or apollo_company.get("website", "")
+        )
+        search_terms = [t for t in [company_name, company_domain] if t and t != "Unknown Company"]
+        if fireflies and search_terms:
+            seen_ids = set()
+            all_transcripts = []
+            for term in search_terms[:2]:
+                try:
+                    txs = fireflies.search_transcripts_by_title(term, limit=5)
+                    for t in txs:
+                        tid = t.get("id")
+                        if tid and tid not in seen_ids:
+                            seen_ids.add(tid)
+                            all_transcripts.append(t)
+                except Exception as e:
+                    print(f"      ⚠️ Fireflies error for '{term}': {e}")
+            if all_transcripts:
+                fireflies_context = fireflies.format_fireflies_context(all_transcripts[:5])
+                print(f"      📞 Found {len(all_transcripts)} call transcript(s) (searched: {', '.join(search_terms)})")
+            else:
+                fireflies_context = "No call transcripts found."
+        elif fireflies:
+            fireflies_context = "No company name or domain available for Fireflies search."
         
         lead["fireflies_context"] = fireflies_context
         
@@ -1455,6 +1962,16 @@ def main():
             for n in notes[:3]
         ]) or "No notes available"
         lead["notes"] = notes_text
+        
+        # Previous emails with this contact (from HubSpot) for thread context
+        try:
+            previous_emails = hubspot.get_contact_emails(contact_id, limit=15)
+            lead["previous_emails_context"] = format_previous_emails_context(previous_emails)
+            if previous_emails:
+                print(f"      📧 Found {len(previous_emails)} previous email(s) in HubSpot")
+        except Exception as e:
+            print(f"      ⚠️ HubSpot emails error: {e}")
+            lead["previous_emails_context"] = "Could not load previous emails."
         
         # Knowledge base context (RAG)
         kb_context = "Knowledge base not available."
@@ -1475,7 +1992,6 @@ def main():
             
             lead["email_subject"] = email_content.get("subject", "Let's connect")
             lead["email_body"] = email_content.get("body", "")
-            lead["talking_points"] = email_content.get("talking_points", [])
             lead["analysis"] = email_content.get("analysis", {})
             lead["flags"] = email_content.get("flags", [])
             
@@ -1485,112 +2001,65 @@ def main():
             print(f"      ❌ Error generating email: {e}")
             lead["email_subject"] = "Let's connect"
             lead["email_body"] = "Error generating email content."
-            lead["talking_points"] = []
             lead["analysis"] = {}
             lead["flags"] = [f"Error: {str(e)}"]
         
+        # Generate LinkedIn connection note (max 300 chars)
+        print(f"      🔗 Generating LinkedIn connection note...")
+        try:
+            note = generate_linkedin_connection_note(claude, lead)
+            lead["linkedin_connection_note"] = note
+            if note:
+                print(f"      ✓ LinkedIn note: {note[:60]}...")
+            else:
+                print(f"      ℹ️ No LinkedIn note generated")
+        except Exception as e:
+            print(f"      ⚠️ LinkedIn note error: {e}")
+            lead["linkedin_connection_note"] = ""
+        
         final_leads.append(lead)
     
-    # Step 5: Save all data to JSON
-    timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+    # Re-split final leads into deepak and marshal groups using assignment marker
+    deepak_final = [lead for lead in final_leads if lead.get("assigned_to") == "deepak"]
+    marshal_final = [lead for lead in final_leads if lead.get("assigned_to") == "marshal"]
     
-    # Prepare JSON-serializable output with all enrichment data
-    json_output = {
-        "generated_at": datetime.now().isoformat(),
-        "filter_config": {
-            "marketing_contacts_only": True,
-            "min_employee_size": MIN_EMPLOYEE_SIZE,
-            "stale_threshold_days": STALE_THRESHOLD_DAYS,
-            "target_industries": TARGET_INDUSTRIES,
-            "target_countries": TARGET_COUNTRIES,
-            "target_job_titles": TARGET_JOB_TITLES,
-            "target_lifecycle_stages": TARGET_LIFECYCLE_STAGES,
-        },
-        "summary": {
-            "contacts_matching_hubspot_filters": len(contacts),
-            "leads_processed": len(qualified_leads),
-            "emails_generated": len(final_leads),
-        },
-        "leads": []
-    }
-    
-    for lead in final_leads:
-        # Build a clean JSON structure for each lead
-        lead_data = {
-            "contact": {
-                "id": lead.get("contact_id"),
-                "name": lead.get("contact_name"),
-                "email": lead.get("contact_email"),
-                "title": lead.get("contact_title"),
-                "linkedin_url": lead.get("contact_linkedin_url"),
-            },
-            "company": {
-                "name": lead.get("company_name"),
-                "industry": lead.get("company_industry"),
-                "size": lead.get("company_size"),
-            },
-            "engagement": {
-                "score": lead.get("engagement_score"),
-                "email_opens": lead.get("email_opens"),
-                "email_clicks": lead.get("email_clicks"),
-                "page_views": lead.get("page_views"),
-                "form_submissions": lead.get("form_submissions"),
-                "meeting_count": lead.get("meeting_count"),
-                "days_since_activity": lead.get("days_since_activity"),
-            },
-            "apollo_enrichment": lead.get("apollo_enrichment", {}),
-            "slack_context": lead.get("slack_context"),
-            "fireflies_context": lead.get("fireflies_context"),
-            "knowledge_base_context": lead.get("knowledge_base_context"),
-            "notes": lead.get("notes"),
-            "generated_email": {
-                "subject": lead.get("email_subject"),
-                "body": lead.get("email_body"),
-                "talking_points": lead.get("talking_points", []),
-                "analysis": lead.get("analysis", {}),
-                "flags": lead.get("flags", []),
-            }
-        }
-        json_output["leads"].append(lead_data)
-    
-    # Print JSON to console for testing/debugging
-    print(f"\n" + "=" * 60)
-    print("📊 LEAD DATA (JSON)")
-    print("=" * 60)
-    print(json.dumps(json_output, indent=2, default=str))
-    print("=" * 60)
-    
-    # Save JSON output to file
-    json_path = f"/Users/sunil/adopt-followup/docs/lead_finder_data_{timestamp}.json"
-    with open(json_path, "w") as f:
-        json.dump(json_output, f, indent=2, default=str)
-    print(f"\n📄 Saved JSON data: {json_path}")
-    
-    # Step 6: Create and send digest
+    # Step 5: Create and send digest
     print(f"\n📧 Creating digest email...")
     
-    html_digest = format_lead_digest_html(final_leads)
-    
-    # Save HTML copy
-    digest_path = f"/Users/sunil/adopt-followup/docs/lead_finder_digest_{timestamp}.html"
-    with open(digest_path, "w") as f:
-        f.write(html_digest)
-    print(f"   📄 Saved HTML digest: {digest_path}")
+    html_digest = format_lead_digest_html(deepak_final, marshal_final)
     
     # Send the email
     if sendgrid_key:
         send_digest_email_sendgrid(LEAD_FINDER_RECIPIENTS, html_digest, sendgrid_key)
     else:
-        print(f"\n⚠️ No SendGrid API key configured. Digest saved to: {digest_path}")
-        print(f"   Set SENDGRID_API_KEY environment variable to enable email delivery.")
+        print(f"\n⚠️ No SendGrid API key configured. Set SENDGRID_API_KEY to enable email delivery.")
+    
+    # Only after digest is built and sent: add this run's leads to the processed log.
+    # Who gets added: exactly the TOP_LEADS_COUNT leads we processed (top N by priority, same
+    # order as final_leads: first half assigned to deepak, second half to marshal). The log
+    # stores contact_ids and emails in sets, so order in the JSON file is arbitrary (not "top 10"
+    # then "bottom 10"). If the run had failed before this point, we would not have saved them.
+    print(f"\n📝 Updating processed contacts log...")
+    processed_contact_ids = processed_log["processed_contact_ids"].copy()
+    processed_emails = processed_log["processed_emails"].copy()
+    for lead in final_leads:
+        contact_id = lead.get("contact_id")
+        contact_email = lead.get("contact_email", "").lower().strip()
+        if contact_id:
+            processed_contact_ids.add(contact_id)
+        if contact_email and contact_email != "no email":
+            processed_emails.add(contact_email)
+    save_processed_contacts_log(processed_contact_ids, processed_emails)
     
     print(f"\n✅ Lead Finder Agent completed successfully!")
     print(f"   Contacts matching HubSpot filters: {len(contacts)}")
+    print(f"   Already processed (skipped): {skipped_count}")
     print(f"   Leads processed: {len(qualified_leads)}")
     print(f"   Emails generated: {len(final_leads)}")
-    print(f"   JSON output: {json_path}")
+    print(f"   Deepak's leads: {len(deepak_final)}")
+    print(f"   Marshal's leads: {len(marshal_final)}")
     
-    return final_leads
+    return {"deepak": deepak_final, "marshal": marshal_final, "all": final_leads}
 
 
 if __name__ == "__main__":

@@ -39,14 +39,27 @@ env/
 .DS_Store
 Thumbs.db
 
-# Logs
+# Logs and lead finder output
 *.log
+cron.log
+logs/
 
 # ChromaDB vector database
 .chroma/
 
 # Knowledge base documents and generated outputs
-docs/
+docs/capabilities
+docs/use-cases
+docs/personas
+docs/case-studies
+docs/value-props
+docs/industries
+docs/decks
 
 # Temporary files
 tmp/
+
+CRON.md 
+
+/csv
+processed_contacts_log.json

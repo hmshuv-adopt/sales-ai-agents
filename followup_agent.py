@@ -39,6 +39,7 @@ import json
 import requests
 from datetime import datetime, timedelta
 from typing import Optional
+from urllib.parse import urlparse
 import anthropic
 from dotenv import load_dotenv
 
@@ -379,6 +380,23 @@ class SlackClient:
             )
         
         return "\n".join(formatted_messages)
+
+
+def extract_domain(url: str) -> str:
+    """Extract domain from URL (e.g. https://www.acme.com/path -> acme.com)."""
+    if not url or not str(url).strip():
+        return ""
+    url = str(url).strip()
+    if not url.startswith(("http://", "https://")):
+        url = "https://" + url
+    try:
+        parsed = urlparse(url)
+        netloc = parsed.netloc or ""
+        if netloc.startswith("www."):
+            netloc = netloc[4:]
+        return netloc.lower() if netloc else ""
+    except Exception:
+        return ""
 
 
 class FirefliesClient:
@@ -748,7 +766,7 @@ def search_company_news(client: anthropic.Anthropic, company_name: str) -> str:
     
     try:
         response = client.messages.create(
-            model="claude-sonnet-4-5-20250929",
+            model="claude-opus-4-6",
             max_tokens=1024,
             tools=[{
                 "type": "web_search_20250305",
@@ -907,7 +925,7 @@ Respond with JSON in this exact format:
 """
 
     response = client.messages.create(
-        model="claude-sonnet-4-5-20250929",
+        model="claude-opus-4-6",
         max_tokens=2000,
         messages=[{"role": "user", "content": prompt}]
     )
@@ -1323,22 +1341,32 @@ def main():
             if unique_messages:
                 print(f"   💬 Found {len(unique_messages)} Slack messages")
         
-        # Search Fireflies for call transcripts by account name
+        # Search Fireflies for call transcripts by account name and company domain
         fireflies_context = "Fireflies integration not enabled."
         account_name = company_props.get("name", "")
-        if fireflies and account_name and account_name != "Unknown Company":
-            print(f"   📞 Searching Fireflies for calls with {account_name}...")
-            try:
-                transcripts = fireflies.search_transcripts_by_title(account_name, limit=5)
-                if transcripts:
-                    fireflies_context = fireflies.format_fireflies_context(transcripts)
-                    print(f"   ✓ Found {len(transcripts)} call transcripts")
-                else:
-                    fireflies_context = "No call transcripts found for this account."
-                    print(f"   ℹ️ No call transcripts found")
-            except Exception as e:
-                print(f"   ⚠️ Fireflies search error: {e}")
-                fireflies_context = f"Fireflies search failed: {str(e)}"
+        company_domain = extract_domain(company_props.get("website") or "")
+        if fireflies and (account_name and account_name != "Unknown Company" or company_domain):
+            search_terms = [t for t in [account_name, company_domain] if t and t != "Unknown Company"]
+            seen_ids = set()
+            all_transcripts = []
+            for term in search_terms[:2]:
+                try:
+                    txs = fireflies.search_transcripts_by_title(term, limit=5)
+                    for t in txs:
+                        tid = t.get("id")
+                        if tid and tid not in seen_ids:
+                            seen_ids.add(tid)
+                            all_transcripts.append(t)
+                except Exception as e:
+                    print(f"   ⚠️ Fireflies search error for '{term}': {e}")
+            if all_transcripts:
+                fireflies_context = fireflies.format_fireflies_context(all_transcripts[:5])
+                print(f"   ✓ Found {len(all_transcripts)} call transcript(s) (searched: {', '.join(search_terms)})")
+            else:
+                fireflies_context = "No call transcripts found for this account."
+                print(f"   ℹ️ No call transcripts found")
+        elif fireflies:
+            fireflies_context = "No account name or domain available for Fireflies search."
         
         # Web search for company news and intelligence
         web_research = "Web search not performed."

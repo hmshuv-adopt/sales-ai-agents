@@ -10,16 +10,19 @@ A suite of AI-powered sales automation agents that identify opportunities and ge
 Identifies **stale deals** in your HubSpot pipeline and generates follow-up emails.
 
 ### 2. Lead Finder Agent (`lead_finder_agent.py`)
-Finds **high-engagement Marketing Contacts** without deals and generates outreach emails to re-engage them.
+Finds **high-engagement Marketing Contacts** without deals, generates outreach emails to re-engage them (using **previous email thread context** from HubSpot for better personalization), and generates **LinkedIn connection notes** (max 300 characters) for use when sending connection requests. Lead count is configurable via `TOP_LEADS_COUNT` and split between assigned recipients.
+
+### 3. CSV Outreach Email Generator (`csv_outreach_emails.py`)
+Reads a **CSV of contacts** (for example from events or list uploads), automatically detects column headers, optionally enriches contacts via **Apollo**, pulls context from the shared **ChromaDB knowledge base**, and can use **Parallel.ai web search** for extra context. Generates **short, personalized LinkedIn InMail-style messages** (around 80 words) for each row and outputs either JSON or a new CSV with an `email_body` column.
 
 ## Features
 
 ### Follow-up Agent
 - **CRM Integration**: Queries HubSpot for deals in specific pipeline stages
 - **Multi-Source Research**: Gathers context from:
-  - 📧 HubSpot emails and notes from Contact, Deal & Account objects
+  - 📧 HubSpot emails and notes from Contact, Deal & Account objects (fetched and included in context; not searched separately)
   - 💬 Slack internal discussions
-  - 📞 Fireflies call transcripts
+  - 📞 Fireflies call transcripts (searched by company name and company domain from website)
   - 🌐 Web search for company news & AI initiatives
   - 📚 Knowledge base (RAG) for relevant product context
 - **AI-Powered Emails**: Uses Claude to generate personalized, context-rich follow-up emails
@@ -27,14 +30,26 @@ Finds **high-engagement Marketing Contacts** without deals and generates outreac
 
 ### Lead Finder Agent
 - **Smart Filtering**: Finds Marketing Contacts with high engagement but no recent activity
+- **Configurable Lead Count**: `TOP_LEADS_COUNT` sets total leads per run; leads are split evenly between assigned recipients (e.g. 10 leads → 5 per person)
 - **Configurable Filters**: Filter by employee size, industry, country, job title, lifecycle stage
 - **Multi-Source Enrichment**:
+  - 📧 **HubSpot previous emails** – Fetches up to 15 prior emails with the contact so the AI can reference the thread, avoid repetition, and build on past conversations
   - 🔍 Apollo.io for company funding, tech stack, and hiring signals
   - 💬 Slack internal discussions
-  - 📞 Fireflies call transcripts
+  - 📞 Fireflies call transcripts (searched by company name and company domain from website/Apollo)
+  - 📝 HubSpot contact notes (fetched and included in context; not searched separately)
   - 📚 Knowledge base (RAG) for relevant product context
-- **Engagement Scoring**: Ranks leads by email opens, clicks, page views, form submissions
-- **AI-Powered Outreach**: Generates personalized re-engagement emails using Claude
+- **Engagement Scoring**: Ranks leads by HubSpot lead scoring or custom engagement (email opens, clicks, page views, form submissions)
+- **AI-Powered Outreach**: Generates personalized re-engagement emails using Claude (with previous-email context for follow-ups)
+- **LinkedIn Connection Notes**: Generates a short, personalized note (max 300 characters) for each lead to use when sending a LinkedIn connection request; included in the digest
+
+### CSV Outreach Email Generator
+- **CSV-First Workflow**: Bring your own CSV (e.g. conference scans, exported lists). The script automatically maps common headers like company, job title, full name, email, sector, website, LinkedIn, location, and interest flags.
+- **Header-Aware Prompting**: On each run, it calls Claude once to generate a **CSV-specific context block** based on your actual headers so the model knows how to best use the columns you provided.
+- **Optional Enrichment**: Uses Apollo to enrich contacts and companies (title, seniority, tech stack, funding, hiring signals) when `APOLLO_API_KEY` is set.
+- **Shared Knowledge Base**: Reuses the same ChromaDB knowledge base as the other agents (via `index_knowledge_base.py`) to pull relevant capabilities, use cases, and persona messaging.
+- **Optional Web Search**: When `PARALLEL_API_KEY` is set, calls the Parallel.ai Search API to add recent company or industry context.
+- **Compact InMail Messages**: Generates a single **≈80-word LinkedIn InMail body** per contact, designed for quick follow-up after events like Manifest – Supply Chain Conference.
 
 ## How It Works
 
@@ -74,14 +89,15 @@ Finds **high-engagement Marketing Contacts** without deals and generates outreac
                                                           │
 ┌─────────────────┐     ┌──────────────────┐              │
 │  Knowledge Base │────▶│  Enrich Context  │◀─────────────┘
-│  (ChromaDB RAG) │     │  Apollo, Slack,  │
-└─────────────────┘     │  Fireflies       │
+│  (ChromaDB RAG) │     │  HubSpot emails, │
+└─────────────────┘     │  Apollo, Slack,  │
+                         │  Fireflies       │
                         └────────┬─────────┘
                                  │
                         ┌────────▼─────────┐
                         │  Claude AI       │
-                        │  (Generate       │
-                        │   Outreach)      │
+                        │  (Email +        │
+                        │   LinkedIn note)  │
                         └────────┬─────────┘
                                  │
                         ┌────────▼─────────┐
@@ -90,13 +106,14 @@ Finds **high-engagement Marketing Contacts** without deals and generates outreac
                         └──────────────────┘
 ```
 
-1. **Query HubSpot** for Marketing Contacts (employee size ≥200, stale >14 days)
-2. **Filter contacts** without deals, matching your criteria
-3. **Score engagement** (email opens, clicks, page views, form submissions)
-4. **Select top 10** leads by engagement score
-5. **Enrich context** from Apollo, Slack, Fireflies, and Knowledge Base
-6. **Generate outreach emails** using Claude with full context
-7. **Send a digest email** with all draft emails ready for review
+1. **Query HubSpot** for Marketing Contacts (optional: employee size, stale threshold)
+2. **Filter contacts** without deals, matching your criteria; skip already-processed contacts
+3. **Score engagement** (HubSpot lead scoring or email opens, clicks, page views, form submissions)
+4. **Select top N** leads (N = `TOP_LEADS_COUNT`), split evenly between assigned recipients
+5. **Enrich context** from HubSpot (previous emails with the contact), Apollo, Slack, Fireflies, and Knowledge Base
+6. **Generate outreach emails** using Claude with full context (including prior email thread for follow-ups)
+7. **Generate LinkedIn connection notes** (max 300 chars each) for use when sending connection requests
+8. **Send a digest email** with draft emails and LinkedIn notes ready for review
 
 ## Quick Start
 
@@ -128,6 +145,16 @@ python followup_agent.py
 
 # Run the Lead Finder Agent (for high-engagement contacts)
 python lead_finder_agent.py
+
+# Run the CSV Outreach Email Generator (for CSV contact lists)
+python csv_outreach_emails.py path/to/contacts.csv
+# Optional flags:
+#   --output emails.json        # JSON output (default if not .csv)
+#   --output emails.csv         # CSV with email_id,email_body columns
+#   --limit 5                   # process only first 5 rows
+#   --no-apollo                 # skip Apollo enrichment
+#   --no-kb                     # skip knowledge base search
+#   --no-csv-context            # don't generate header-aware CSV context
 ```
 
 ### 5. Test with a Single Deal (Optional)
@@ -169,14 +196,15 @@ pypdf>=3.0.0              # For PDF document loading
 
 ### API Keys & Tokens
 
-| Service | Follow-up Agent | Lead Finder Agent | Purpose |
-|---------|-----------------|-------------------|---------|
-| [Anthropic](https://console.anthropic.com/) | ✅ Required | ✅ Required | Claude AI for email generation |
-| [HubSpot](https://developers.hubspot.com/) | ✅ Required | ✅ Required | CRM data (deals, contacts, companies) |
-| [SendGrid](https://sendgrid.com/) | ✅ Required | ✅ Required | Email delivery |
-| [Slack](https://api.slack.com/) | ❌ Optional | ❌ Optional | Internal discussion search |
-| [Fireflies.ai](https://fireflies.ai/) | ❌ Optional | ❌ Optional | Call transcript search |
-| [Apollo.io](https://www.apollo.io/) | ❌ Not used | ❌ Optional | Contact/company enrichment |
+| Service | Follow-up Agent | Lead Finder Agent | CSV Outreach Emails | Purpose |
+|---------|-----------------|-------------------|----------------------|---------|
+| [Anthropic](https://console.anthropic.com/) | ✅ Required | ✅ Required | ✅ Required | Claude AI for email / InMail generation |
+| [HubSpot](https://developers.hubspot.com/) | ✅ Required | ✅ Required | ❌ Not used | CRM data (deals, contacts, companies) |
+| [SendGrid](https://sendgrid.com/) | ✅ Required | ✅ Required | ❌ Not used | Email delivery |
+| [Slack](https://api.slack.com/) | ❌ Optional | ❌ Optional | ❌ Not used | Internal discussion search |
+| [Fireflies.ai](https://fireflies.ai/) | ❌ Optional | ❌ Optional | ❌ Not used | Call transcript search |
+| [Apollo.io](https://www.apollo.io/) | ❌ Not used | ❌ Optional | ❌ Optional | Contact/company enrichment |
+| [Parallel.ai](https://parallel.ai/) | ❌ Not used | ❌ Not used | ❌ Optional | Web search enrichment for companies |
 
 ## Configuration
 
@@ -220,6 +248,12 @@ SLACK_CHANNELS=sales,marketing,support
 
 # Fireflies - for searching call transcripts
 FIREFLIES_API_KEY=xxxxx
+
+# Parallel.ai - for CSV outreach web search enrichment (csv_outreach_emails.py)
+PARALLEL_API_KEY=xxxxx
+
+# Apollo.io - for CSV outreach enrichment (shared with Lead Finder)
+APOLLO_API_KEY=xxxxx
 ```
 
 ### Optional Customization
@@ -248,7 +282,7 @@ TARGET_COUNTRIES=United States,Canada
 TARGET_JOB_TITLES=VP,Director,Head of,Chief,Manager
 TARGET_LIFECYCLE_STAGES=lead,marketingqualifiedlead
 
-# Number of top leads to process
+# Number of top leads per run (split evenly between recipients; e.g. 10 → 5 each)
 TOP_LEADS_COUNT=10
 ```
 
@@ -261,7 +295,7 @@ TOP_LEADS_COUNT=10
    - `crm.objects.deals.read`
    - `crm.objects.contacts.read`
    - `crm.objects.companies.read`
-   - `sales-email-read`
+   - `sales-email-read` (required for Lead Finder to fetch previous emails with contacts)
 3. Copy the access token to your `.env`
 
 ### Slack Bot (Optional)

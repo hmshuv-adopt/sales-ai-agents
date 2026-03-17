@@ -18,6 +18,7 @@ import json
 import requests
 from datetime import datetime, timedelta
 from typing import Optional
+from urllib.parse import urlparse
 import anthropic
 from dotenv import load_dotenv
 
@@ -322,9 +323,26 @@ class SlackClient:
         return "\n".join(formatted_messages)
 
 
+def extract_domain(url: str) -> str:
+    """Extract domain from URL (e.g. https://www.acme.com/path -> acme.com)."""
+    if not url or not str(url).strip():
+        return ""
+    url = str(url).strip()
+    if not url.startswith(("http://", "https://")):
+        url = "https://" + url
+    try:
+        parsed = urlparse(url)
+        netloc = parsed.netloc or ""
+        if netloc.startswith("www."):
+            netloc = netloc[4:]
+        return netloc.lower() if netloc else ""
+    except Exception:
+        return ""
+
+
 class FirefliesClient:
     """Client for Fireflies.ai API interactions."""
-    
+
     def __init__(self, api_key: str):
         self.api_key = api_key
         self.base_url = "https://api.fireflies.ai/graphql"
@@ -961,30 +979,39 @@ def main():
         slack_context = slack.format_slack_context(unique_messages[:10])
         print(f"   Total unique messages: {len(unique_messages)}")
     
-    # Fireflies search by account name
+    # Fireflies search by account name and company domain
     print(f"\n📞 Searching Fireflies for call transcripts...")
     fireflies_context = "Fireflies integration not enabled."
     account_name = company_props.get("name", "")
-    if fireflies and account_name and account_name != "Unknown Company":
-        try:
-            transcripts = fireflies.search_transcripts_by_title(account_name, limit=5)
-            if transcripts:
-                fireflies_context = fireflies.format_fireflies_context(transcripts)
-                print(f"   ✓ Found {len(transcripts)} call transcripts")
-                print(f"\n   --- Fireflies Results ---")
-                print(f"   {fireflies_context[:500]}..." if len(fireflies_context) > 500 else f"   {fireflies_context}")
-                print(f"   --- End Fireflies Results ---\n")
-            else:
-                fireflies_context = "No call transcripts found for this account."
-                print(f"   ℹ️ No call transcripts found for {account_name}")
-        except Exception as e:
-            print(f"   ⚠️ Fireflies search error: {e}")
-            fireflies_context = f"Fireflies search failed: {str(e)}"
+    company_domain = extract_domain(company_props.get("website") or "")
+    search_terms = [t for t in [account_name, company_domain] if t and t != "Unknown Company"]
+    if fireflies and search_terms:
+        seen_ids = set()
+        all_transcripts = []
+        for term in search_terms[:2]:
+            try:
+                txs = fireflies.search_transcripts_by_title(term, limit=5)
+                for t in txs:
+                    tid = t.get("id")
+                    if tid and tid not in seen_ids:
+                        seen_ids.add(tid)
+                        all_transcripts.append(t)
+            except Exception as e:
+                print(f"   ⚠️ Fireflies search error for '{term}': {e}")
+        if all_transcripts:
+            fireflies_context = fireflies.format_fireflies_context(all_transcripts[:5])
+            print(f"   ✓ Found {len(all_transcripts)} call transcript(s) (searched: {', '.join(search_terms)})")
+            print(f"\n   --- Fireflies Results ---")
+            print(f"   {fireflies_context[:500]}..." if len(fireflies_context) > 500 else f"   {fireflies_context}")
+            print(f"   --- End Fireflies Results ---\n")
+        else:
+            fireflies_context = "No call transcripts found for this account."
+            print(f"   ℹ️ No call transcripts found")
     else:
         if not fireflies:
             print(f"   ℹ️ Fireflies not configured")
         else:
-            print(f"   ℹ️ No account name available for Fireflies search")
+            print(f"   ℹ️ No account name or domain available for Fireflies search")
     
     # Web search
     print(f"\n🌐 Searching web for company news...")
