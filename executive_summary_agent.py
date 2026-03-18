@@ -557,36 +557,36 @@ def build_deal_context(
     }
 
 
-# --- Claude: generate 4-6 sentence executive summary per deal ---
+# --- Claude: generate 5-bullet Q&A summary per deal ---
 
 
 def generate_deal_summary(
     client: anthropic.Anthropic, deal_context: dict
 ) -> str:
     """
-    Call Claude (claude-3-5-sonnet) to generate a 4-6 sentence executive summary
-    for one deal. Professional, honest (call out if stuck), ending with one clear next action.
+    Call Claude (claude-3-5-sonnet) to generate a 5-bullet Q&A summary for one deal.
     """
-    system = """You are a senior sales intelligence assistant helping an executive team understand their deal pipeline. Your job is to write brief, accurate executive summaries of individual deals. Be professional and conversational. Be honest: if a deal looks stuck or cold, say so clearly. Do not invent any information that is not present in the context. Always end with one specific, actionable next step for the sales team."""
+    system = """You are a senior sales intelligence assistant helping an executive team quickly understand their pipeline. Be direct, factual, and concise. Never invent information not present in the context provided."""
 
-    user = f"""Based on the following deal context, write a single paragraph (4-6 sentences) that covers:
-1. Who the contact is and what their company does
-2. Current deal stage and deal value
-3. What the last interaction was and when
-4. Whether the deal looks healthy, progressing, or stuck
-5. One clear recommended next action for the sales team
-
-Write in a professional but conversational tone. Do not use bullet points — write one flowing paragraph. Do not make up facts.
-
-Deal context:
-- Deal: {deal_context['deal_name']} | Stage: {deal_context['stage']} | Value: {deal_context['deal_value']} | Owner: {deal_context['deal_owner']}
+    context_text = f"""- Deal: {deal_context['deal_name']} | Stage: {deal_context['stage']} | Value: {deal_context['deal_value']} | Owner: {deal_context['deal_owner']}
 - Contact: {deal_context['contact_name']}, {deal_context['contact_title']} | {deal_context['contact_email']}
 - Company: {deal_context['company_name']} | Industry: {deal_context['company_industry']} | Size: {deal_context['company_size']}
 - Last email: {deal_context['last_email_date']} — Subject: {deal_context['last_email_subject']}
 - Last note/activity: {deal_context['last_note_date']} — {deal_context['last_note_text'][:300]}
-- Days since last activity: {deal_context['days_since_activity']}
+- Days since last activity: {deal_context['days_since_activity']}"""
 
-Write your 4-6 sentence executive summary paragraph below:"""
+    user = f"""Based on the deal information below, answer these 5 questions in short, crisp bullet points. Skip any question if the information is not available — do not guess or invent. Do NOT repeat deal value, company name, or stage as those are already shown above the summary.
+
+Deal Context:
+{context_text}
+
+Answer in this exact format:
+- What does the prospect need solved? <1 sentence — core pain point or use case>
+- Where are we in the process? <current progress + next concrete step>
+- Do we know when they're ready to decide? <timeline or "No timeline identified">
+- Who's the champion and decision-maker? <names and roles, or "Not identified">
+- Biggest risk or blocker? <the one thing that could stall this deal>
+"""
 
     try:
         response = client.messages.create(
