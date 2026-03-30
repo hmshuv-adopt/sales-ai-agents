@@ -25,10 +25,12 @@ Environment Variables Required:
 Environment Variables Optional:
     SUMMARY_STAGE_LABELS - Comma-separated display names for stages (e.g. Potential Fit,Proposal Sent,Negotiation,Contract)
     EXECUTIVE_SUMMARY_SUBJECT - Email subject; use {date} for today's date (default: Daily Deal Pipeline Summary — {date})
+    HUBSPOT_PORTAL_ID - HubSpot account ID (numeric) for "Open deal in HubSpot" links in the digest (from your HubSpot URL or Settings → Account Defaults)
     SENDGRID_API_KEY - SendGrid API key for email delivery
     SMTP_HOST, SMTP_PORT, SMTP_USER, SMTP_PASSWORD - SMTP fallback if SendGrid not set
 """
 
+import base64
 import os
 import html
 import requests
@@ -42,6 +44,75 @@ load_dotenv()
 
 # Configuration
 HUBSPOT_BASE_URL = "https://api.hubapi.com"
+
+
+def get_hubspot_deal_record_url(deal_id: str) -> Optional[str]:
+    """
+    Build a direct link to the deal record in HubSpot CRM.
+    Requires HUBSPOT_PORTAL_ID (numeric Hub ID from app URL: app.hubspot.com/contacts/{id}/...).
+    """
+    portal = os.getenv("HUBSPOT_PORTAL_ID", "").strip()
+    if not portal or not deal_id:
+        return None
+    return f"https://app-na2.hubspot.com/contacts/{portal}/record/0-3/{deal_id}/"
+
+# Adopt AI logo (PNG) for email header — embed as data URI so it works without a public URL
+ADOPT_AI_LOGO_PATH = os.path.join(os.path.dirname(__file__), "assets", "adopt_ai_logo.png")
+
+# Brand accents (align with Adopt AI logo: blue primary, warm secondary)
+BRAND_BLUE = "#2563EB"
+BRAND_NAVY = "#1e3a5f"
+BRAND_MUTED = "#64748b"
+
+
+def get_adopt_ai_logo_img_tag(max_height: int = 56) -> str:
+    """
+    Return an <img> tag with the Adopt AI logo embedded as base64, or empty string if missing.
+    """
+    if not os.path.isfile(ADOPT_AI_LOGO_PATH):
+        return ""
+    try:
+        with open(ADOPT_AI_LOGO_PATH, "rb") as f:
+            b64 = base64.standard_b64encode(f.read()).decode("ascii")
+    except OSError:
+        return ""
+    return (
+        f'<img src="data:image/png;base64,{b64}" alt="Adopt AI" width="120" '
+        f'style="display:block; height:{max_height}px; width:auto; max-width:140px; border:0; outline:none;" />'
+    )
+
+
+def _email_header_block(today: str, total_deals: int, stage_count: int, generated_at: str) -> str:
+    """Branded header row: logo + title and stats (table layout for email clients)."""
+    logo = get_adopt_ai_logo_img_tag(56)
+    logo_cell = (
+        f'<td valign="middle" style="padding:0 20px 0 0; width:1%;">{logo}</td>'
+        if logo
+        else ""
+    )
+    return f"""
+    <div style="background:linear-gradient(135deg, #0f172a 0%, #1e3a5f 42%, #1d4ed8 100%); color:#ffffff; padding:32px 28px;">
+        <table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="border-collapse:collapse;">
+        <tr>
+            {logo_cell}
+            <td valign="middle" style="padding:0;">
+                <p style="margin:0 0 6px 0; font-size:12px; font-weight:700; letter-spacing:0.14em; text-transform:uppercase; opacity:0.88; color:#e0e7ff;">Adopt AI · Sales</p>
+                <h1 style="margin:0; font-size:26px; font-weight:700; letter-spacing:-0.02em; line-height:1.2; color:#ffffff;">Pipeline summary</h1>
+                <p style="margin:10px 0 0 0; font-size:16px; line-height:1.45; opacity:0.94; color:#e2e8f0;">{html.escape(today)}</p>
+                <table role="presentation" cellpadding="0" cellspacing="0" style="margin-top:20px; border-collapse:collapse;">
+                <tr>
+                    <td style="padding:10px 16px; background:rgba(255,255,255,0.18); border-radius:10px; font-size:14px; font-weight:600; color:#ffffff;">{total_deals} deals</td>
+                    <td width="10"></td>
+                    <td style="padding:10px 16px; background:rgba(255,255,255,0.18); border-radius:10px; font-size:14px; font-weight:600; color:#ffffff;">{stage_count} stages</td>
+                    <td width="10"></td>
+                    <td style="padding:10px 16px; background:rgba(255,255,255,0.12); border-radius:10px; font-size:13px; color:#e2e8f0;">{html.escape(generated_at)}</td>
+                </tr>
+                </table>
+            </td>
+        </tr>
+        </table>
+    </div>
+"""
 
 # Digest recipients (comma-separated in env var)
 EXECUTIVE_SUMMARY_RECIPIENTS = [
@@ -306,39 +377,6 @@ class HubSpotClient:
 
         return notes_response.json().get("results", [])
 
-    def get_owners(self) -> dict:
-        """Fetch all owners and return a map of owner_id -> email (or id if no email)."""
-        url = f"{HUBSPOT_BASE_URL}/crm/v3/owners"
-        result = {}
-        after = None
-
-        while True:
-            params = {"limit": 100}
-            if after:
-                params["after"] = after
-
-            response = requests.get(url, headers=self.headers, params=params)
-            response.raise_for_status()
-            data = response.json()
-
-            for owner in data.get("results", []):
-                oid = owner.get("id")
-                if oid:
-                    # Prefer email, else firstname + lastname, else id
-                    email = owner.get("email", "")
-                    first = owner.get("firstName", "")
-                    last = owner.get("lastName", "")
-                    name = f"{first} {last}".strip() or email or str(oid)
-                    result[str(oid)] = name
-
-            paging = data.get("paging", {})
-            if paging.get("next"):
-                after = paging["next"].get("after")
-            else:
-                break
-
-        return result
-
 
 # --- Helpers: last email (any direction), last note, days since ---
 
@@ -445,7 +483,6 @@ def format_deal_value(amount: Optional[str], currency_code: Optional[str]) -> st
 def build_deal_context(
     deal: dict,
     hubspot: HubSpotClient,
-    owners_map: dict,
     stage_label: str,
 ) -> Optional[dict]:
     """
@@ -460,8 +497,6 @@ def build_deal_context(
     stage_id = props.get("dealstage", "")
     amount = props.get("amount")
     currency_code = props.get("deal_currency_code")
-    owner_id = props.get("hubspot_owner_id", "")
-    deal_owner = owners_map.get(str(owner_id), owner_id or "Unassigned")
 
     # Associated contact
     try:
@@ -535,10 +570,11 @@ def build_deal_context(
         days_since_activity = "N/A"
 
     return {
+        "deal_id": deal_id,
+        "deal_hubspot_url": get_hubspot_deal_record_url(deal_id),
         "deal_name": deal_name,
         "stage": stage_label,
         "deal_value": format_deal_value(amount, currency_code),
-        "deal_owner": deal_owner,
         "contact_name": contact_name,
         "contact_title": contact_title,
         "contact_email": contact_email,
@@ -566,26 +602,26 @@ def generate_deal_summary(
     """
     Call Claude (claude-3-5-sonnet) to generate a 5-bullet Q&A summary for one deal.
     """
-    system = """You are a senior sales intelligence assistant helping an executive team quickly understand their pipeline. Be direct, factual, and concise. Never invent information not present in the context provided."""
+    system = """You are a senior sales intelligence assistant for executives. Be direct, factual, and extremely concise. Use the fewest words that keep meaning clear. Never invent facts. Do not repeat company name, deal value, stage, or contact identity—the digest already shows those. Avoid filler phrases like "Based on the context" or "It appears that"."""
 
-    context_text = f"""- Deal: {deal_context['deal_name']} | Stage: {deal_context['stage']} | Value: {deal_context['deal_value']} | Owner: {deal_context['deal_owner']}
+    context_text = f"""- Deal: {deal_context['deal_name']} | Stage: {deal_context['stage']} | Value: {deal_context['deal_value']}
 - Contact: {deal_context['contact_name']}, {deal_context['contact_title']} | {deal_context['contact_email']}
 - Company: {deal_context['company_name']} | Industry: {deal_context['company_industry']} | Size: {deal_context['company_size']}
 - Last email: {deal_context['last_email_date']} — Subject: {deal_context['last_email_subject']}
 - Last note/activity: {deal_context['last_note_date']} — {deal_context['last_note_text'][:300]}
 - Days since last activity: {deal_context['days_since_activity']}"""
 
-    user = f"""Based on the deal information below, answer these 5 questions in short, crisp bullet points. Skip any question if the information is not available — do not guess or invent. Do NOT repeat deal value, company name, or stage as those are already shown above the summary.
+    user = f"""Using the deal context below, answer exactly 5 bullets. Each answer: one short phrase or single sentence only (aim under ~20 words). Skip a bullet entirely if the context has nothing relevant—do not guess. Never restate company, stage, deal value, or contact name.
 
 Deal Context:
 {context_text}
 
-Answer in this exact format:
-- What does the prospect need solved? <1 sentence — core pain point or use case>
-- Where are we in the process? <current progress + next concrete step>
-- Do we know when they're ready to decide? <timeline or "No timeline identified">
-- Who's the champion and decision-maker? <names and roles, or "Not identified">
-- Biggest risk or blocker? <the one thing that could stall this deal>
+Use this exact bullet format (question text unchanged; replace angle brackets with your terse answer):
+- What does the prospect need solved? <core pain or use case, or omit line if unknown>
+- Where are we in the process? <status + one next step, or omit line if unknown>
+- Do we know when they're ready to decide? <timeline, or omit line if unknown>
+- Who's the champion and decision-maker? <names/roles, or omit line if unknown>
+- Biggest risk or blocker? <one risk, or omit line if unknown>
 """
 
     try:
@@ -618,32 +654,80 @@ def _stage_style(label: str) -> tuple[str, str]:
     return STAGE_COLORS.get(key, ("#f3f4f6", "#6b7280"))
 
 
+def format_ai_summary_for_email(raw_summary: str) -> str:
+    """
+    Turn Claude's bullet Q&A text into HTML: each bullet highlights the question
+    and shows the answer clearly. Falls back to escaped plain text if lines don't match.
+    """
+    if not raw_summary or not raw_summary.strip():
+        return f'<p style="margin:0;color:{BRAND_MUTED};font-size:15px;line-height:1.6;">No summary available.</p>'
+
+    parts: list[str] = []
+    for line in raw_summary.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        # Strip common bullet prefixes
+        if line.startswith(("- ", "• ", "* ")):
+            line = line[2:].strip()
+        elif line.startswith(("-", "•", "*")) and len(line) > 1 and line[1] in " \t":
+            line = line[1:].strip()
+
+        q_idx = line.find("?")
+        if q_idx != -1:
+            question = line[: q_idx + 1].strip()
+            answer = line[q_idx + 1 :].strip()
+            answer_html = (
+                html.escape(answer)
+                if answer
+                else '<span style="color:#94a3b8;font-style:italic;">—</span>'
+            )
+            parts.append(
+                f"""
+            <div style="margin:0 0 16px 0; padding:14px 16px; background:#ffffff; border-radius:10px; border:1px solid #e2e8f0; border-left:4px solid {BRAND_BLUE};">
+                <div style="font-size:11px; font-weight:700; color:{BRAND_NAVY}; letter-spacing:0.06em; text-transform:uppercase; margin-bottom:8px;">Question</div>
+                <div style="font-size:15px; font-weight:600; color:#0f172a; margin-bottom:10px; line-height:1.45;">{html.escape(question)}</div>
+                <div style="font-size:11px; font-weight:700; color:{BRAND_MUTED}; letter-spacing:0.06em; text-transform:uppercase; margin-bottom:6px;">Answer</div>
+                <div style="font-size:15px; color:#334155; line-height:1.6;">{answer_html}</div>
+            </div>"""
+            )
+        else:
+            parts.append(
+                f'<p style="margin:0 0 12px 0; font-size:15px; color:#334155; line-height:1.6;">{html.escape(line)}</p>'
+            )
+
+    if not parts:
+        return f'<p style="margin:0;color:#64748b;">{html.escape(raw_summary.strip())}</p>'
+    return "\n".join(parts)
+
+
 def format_digest_html(
     deals_by_stage: dict[str, list[dict]], stage_order: list[str], stage_labels: list[str]
 ) -> str:
     """
-    Build the executive summary HTML email: header, subheader, one section per stage
-    (skipped if no deals), then each deal with AI summary box. Inline CSS only.
+    Build the executive summary HTML email: polished layout, stage sections,
+    deal cards with meta rows, and Q&A bullets highlighted for questions vs answers.
     """
     today = datetime.now().strftime("%B %d, %Y")
     total_deals = sum(len(deals) for deals in deals_by_stage.values())
-    # Time in IST (UTC+5:30)
+    stage_count = len([s for s in stage_order if deals_by_stage.get(s)])
     ist = timezone(timedelta(hours=5, minutes=30))
     generated_at = datetime.now(ist).strftime("%I:%M %p IST")
 
-    # Use 'output' so we don't shadow the 'html' module (needed for html.escape)
     output = f"""
 <!DOCTYPE html>
 <html>
 <head>
     <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>Executive Deal Pipeline Summary</title>
 </head>
-<body style="font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; line-height: 1.6; color: #333; max-width: 800px; margin: 0 auto; padding: 20px;">
-    <div style="background: linear-gradient(135deg, #1e3a5f 0%, #2d5a87 100%); color: white; padding: 24px; border-radius: 10px; margin-bottom: 24px;">
-        <h1 style="margin: 0; font-size: 22px;">📊 Executive Deal Pipeline Summary | {today}</h1>
-        <p style="margin: 10px 0 0 0; opacity: 0.95; font-size: 14px;">Total deals: {total_deals} across {len([s for s in stage_order if deals_by_stage.get(s)])} stages | Generated at {generated_at}</p>
-    </div>
+<body style="margin:0; padding:28px 14px; background-color:#f1f5f9; font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif; line-height:1.6; color:#0f172a; -webkit-font-smoothing:antialiased;">
+    <table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="border-collapse:collapse;">
+    <tr><td align="center">
+    <div style="max-width:680px; margin:0 auto; background:#ffffff; border-radius:20px; overflow:hidden; box-shadow:0 8px 32px rgba(15,23,42,0.1); border:1px solid #e2e8f0;">
+{_email_header_block(today, total_deals, stage_count, generated_at)}
+    <div style="padding:28px 24px 36px 24px;">
 """
 
     for stage_id, label in zip(stage_order, stage_labels):
@@ -652,31 +736,72 @@ def format_digest_html(
             continue
 
         bg, border = _stage_style(label)
+        safe_label = html.escape(label.upper())
         output += f"""
-    <div style="margin-bottom: 24px;">
-        <h2 style="font-size: 16px; margin: 0 0 12px 0; color: #374151;">{label.upper()} — {len(deals)} Deal(s)</h2>
+    <div style="margin-bottom:36px;">
+        <div style="display:inline-block; padding:10px 18px; border-radius:999px; background:{bg}; border:1px solid {border}; font-size:13px; font-weight:700; letter-spacing:0.03em; color:#0f172a; margin-bottom:18px;">
+            {safe_label} &nbsp;·&nbsp; {len(deals)} deal(s)
+        </div>
 """
         for d in deals:
-            # Escape user content for safe HTML (use 'html' module, not local variable)
-            safe_summary = html.escape(d.get("ai_summary", "No summary available.")).replace(
-                "\n", "<br>"
-            )
+            summary_html = format_ai_summary_for_email(d.get("ai_summary", ""))
+            hs_url = d.get("deal_hubspot_url")
+            if hs_url:
+                href = html.escape(hs_url, quote=True)
+                hubspot_row = f"""                <tr>
+                    <td style="padding:10px 12px 6px 0; font-size:12px; font-weight:700; color:{BRAND_MUTED}; text-transform:uppercase; letter-spacing:0.04em; vertical-align:middle;">HubSpot</td>
+                    <td style="padding:10px 0 6px 0; vertical-align:middle;"><a href="{href}" target="_blank" rel="noopener noreferrer" style="font-size:15px; font-weight:600; color:{BRAND_BLUE}; text-decoration:underline;">Open deal in HubSpot →</a></td>
+                </tr>"""
+            else:
+                hubspot_row = f"""                <tr>
+                    <td colspan="2" style="padding:10px 0 6px 0; font-size:13px; color:#94a3b8; line-height:1.5;">Set <strong style="color:#64748b;">HUBSPOT_PORTAL_ID</strong> in your environment for a direct link to this deal in HubSpot.</td>
+                </tr>"""
             output += f"""
-        <div style="background: #fafafa; border-radius: 8px; padding: 16px; margin-bottom: 16px; border-left: 4px solid {border};">
-            <p style="margin: 0 0 8px 0; font-size: 15px;"><strong>{html.escape(str(d['deal_name']))}</strong> | {html.escape(str(d['stage']))} | {html.escape(str(d['deal_value']))}</p>
-            <p style="margin: 0 0 8px 0; font-size: 13px; color: #555;">Contact: {html.escape(str(d['contact_name']))}, {html.escape(str(d['contact_title']))} | Company: {html.escape(str(d['company_name']))}, {html.escape(str(d['company_industry']))}, {html.escape(str(d['company_size']))}</p>
-            <p style="margin: 0 0 12px 0; font-size: 13px; color: #666;">Last Activity: {html.escape(str(d['last_email_date']))} — {html.escape(str(d['days_since_activity']))} days ago | Last Email Subject: {html.escape(str(d['last_email_subject']))}</p>
-            <div style="background: #e5e7eb; border-left: 3px solid #6b7280; padding: 12px; margin-top: 8px; font-size: 13px; color: #374151; line-height: 1.5;">
-                {safe_summary}
+        <div style="background:#f8fafc; border-radius:14px; padding:22px 20px; margin-bottom:22px; border:1px solid #e2e8f0; border-left:4px solid {border};">
+            <div style="margin-bottom:18px; padding-bottom:18px; border-bottom:1px solid #e2e8f0;">
+                <h2 style="margin:0 0 12px 0; font-size:20px; font-weight:700; color:#0f172a; line-height:1.35;">{html.escape(str(d['deal_name']))}</h2>
+                <table role="presentation" cellpadding="0" cellspacing="0" style="border-collapse:collapse;">
+                <tr>
+                    <td style="padding:6px 12px 6px 0; font-size:12px; font-weight:700; color:{BRAND_MUTED}; text-transform:uppercase; letter-spacing:0.04em; vertical-align:top;">Stage</td>
+                    <td style="padding:6px 0; font-size:15px; font-weight:600; color:#334155; line-height:1.5;">{html.escape(str(d['stage']))}</td>
+                </tr>
+                <tr>
+                    <td style="padding:6px 12px 6px 0; font-size:12px; font-weight:700; color:{BRAND_MUTED}; text-transform:uppercase; letter-spacing:0.04em; vertical-align:top;">Value</td>
+                    <td style="padding:6px 0; font-size:15px; font-weight:700; color:#059669; line-height:1.5;">{html.escape(str(d['deal_value']))}</td>
+                </tr>
+{hubspot_row}
+                </table>
+            </div>
+            <div style="background:#ffffff; border-radius:12px; padding:16px 18px; margin-bottom:16px; border:1px solid #e2e8f0;">
+                <p style="margin:0 0 10px 0; font-size:11px; font-weight:700; color:{BRAND_BLUE}; text-transform:uppercase; letter-spacing:0.08em;">Contact</p>
+                <p style="margin:0; font-size:16px; color:#0f172a; font-weight:600; line-height:1.4;">{html.escape(str(d['contact_name']))}</p>
+                <p style="margin:6px 0 0 0; font-size:15px; color:#475569; line-height:1.55;">{html.escape(str(d['contact_title']))}<br/><span style="color:#2563EB;">{html.escape(str(d['contact_email']))}</span></p>
+            </div>
+            <div style="background:#ffffff; border-radius:12px; padding:16px 18px; margin-bottom:16px; border:1px solid #e2e8f0;">
+                <p style="margin:0 0 10px 0; font-size:11px; font-weight:700; color:{BRAND_BLUE}; text-transform:uppercase; letter-spacing:0.08em;">Company</p>
+                <p style="margin:0; font-size:16px; color:#0f172a; font-weight:600; line-height:1.4;">{html.escape(str(d['company_name']))}</p>
+                <p style="margin:6px 0 0 0; font-size:15px; color:#475569; line-height:1.55;">{html.escape(str(d['company_industry']))} · {html.escape(str(d['company_size']))}</p>
+            </div>
+            <div style="background:#ffffff; border-radius:12px; padding:16px 18px; margin-bottom:20px; border:1px solid #e2e8f0;">
+                <p style="margin:0 0 10px 0; font-size:11px; font-weight:700; color:{BRAND_BLUE}; text-transform:uppercase; letter-spacing:0.08em;">Last touch</p>
+                <p style="margin:0; font-size:15px; color:#334155; line-height:1.55;"><strong style="color:#0f172a;">{html.escape(str(d['last_email_date']))}</strong> · {html.escape(str(d['days_since_activity']))} days since last activity</p>
+                <p style="margin:8px 0 0 0; font-size:14px; color:{BRAND_MUTED}; line-height:1.5;">Last email subject: {html.escape(str(d['last_email_subject']))}</p>
+            </div>
+            <div style="background:#eff6ff; border-radius:14px; padding:18px; border:1px solid #bfdbfe;">
+                <p style="margin:0 0 16px 0; font-size:12px; font-weight:700; color:{BRAND_NAVY}; text-transform:uppercase; letter-spacing:0.1em;">Key signals · Q&amp;A</p>
+                {summary_html}
             </div>
         </div>
 """
         output += "    </div>\n"
 
     output += """
-    <div style="text-align: center; color: #9ca3af; font-size: 12px; margin-top: 32px; padding-top: 16px; border-top: 1px solid #e5e7eb;">
-        <p style="margin: 0;">This digest was auto-generated by Sales AI Agent. Do not reply to this email.</p>
     </div>
+    <div style="padding:24px 28px 32px 28px; text-align:center; border-top:1px solid #e2e8f0; background:#f8fafc;">
+        <p style="margin:0; font-size:13px; color:#64748b; line-height:1.65;">This digest was auto-generated by <strong style="color:#1e3a5f;">Adopt AI</strong> for your sales team.<br/><span style="font-size:12px; color:#94a3b8;">Do not reply to this email.</span></p>
+    </div>
+    </div>
+    </td></tr></table>
 </body>
 </html>
 """
@@ -693,7 +818,7 @@ def send_digest_email_sendgrid(
     url = "https://api.sendgrid.com/v3/mail/send"
     payload = {
         "personalizations": [{"to": [{"email": e} for e in to_emails]}],
-        "from": {"email": FROM_EMAIL, "name": "Executive Summary Agent"},
+        "from": {"email": FROM_EMAIL, "name": "Adopt AI · Pipeline summary"},
         "subject": subject,
         "content": [{"type": "text/html", "value": html_content}],
     }
@@ -768,7 +893,6 @@ def main() -> list[dict]:
         "dealstage",
         "amount",
         "deal_currency_code",
-        "hubspot_owner_id",
         "closedate",
         "hs_lastmodifieddate",
     ]
@@ -787,12 +911,8 @@ def main() -> list[dict]:
         if stage_id in deals_by_stage:
             deals_by_stage[stage_id].append(deal)
 
-    # Owners map for display names
-    try:
-        owners_map = hubspot.get_owners()
-    except Exception as e:
-        print(f"   ⚠️ Could not fetch owners: {e}. Using owner IDs.")
-        owners_map = {}
+    if not os.getenv("HUBSPOT_PORTAL_ID", "").strip():
+        print("   ℹ️ HUBSPOT_PORTAL_ID not set — digest will omit one-click HubSpot deal links")
 
     # Build context and AI summary for each deal (try/except per deal)
     enriched_by_stage = {s: [] for s in SUMMARY_STAGES}
@@ -807,7 +927,7 @@ def main() -> list[dict]:
             total_processed += 1
             print(f"\n🔍 Processing deal {total_processed}/{len(all_deals)}: {deal_name}")
             try:
-                ctx = build_deal_context(deal, hubspot, owners_map, stage_label)
+                ctx = build_deal_context(deal, hubspot, stage_label)
                 if not ctx:
                     total_failed += 1
                     continue
@@ -832,19 +952,22 @@ def main() -> list[dict]:
 
     # If no deals at all, still send a short digest so recipients know the run succeeded
     if len(all_deals) == 0:
+        gen_ist = datetime.now(timezone(timedelta(hours=5, minutes=30))).strftime("%I:%M %p IST")
+        today_hdr = datetime.now().strftime("%B %d, %Y")
         html_digest = f"""
 <!DOCTYPE html>
 <html>
-<head><meta charset="utf-8"><title>Executive Deal Pipeline Summary</title></head>
-<body style="font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; line-height: 1.6; color: #333; max-width: 800px; margin: 0 auto; padding: 20px;">
-    <div style="background: linear-gradient(135deg, #1e3a5f 0%, #2d5a87 100%); color: white; padding: 24px; border-radius: 10px;">
-        <h1 style="margin: 0; font-size: 22px;">📊 Executive Deal Pipeline Summary | {datetime.now().strftime('%B %d, %Y')}</h1>
-        <p style="margin: 10px 0 0 0;">Total deals: 0 across 0 stages | Generated at {datetime.now(timezone(timedelta(hours=5, minutes=30))).strftime('%I:%M %p IST')}</p>
+<head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1.0"><title>Executive Deal Pipeline Summary</title></head>
+<body style="margin:0; padding:28px 14px; background-color:#f1f5f9; font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif; line-height:1.6;">
+<table role="presentation" width="100%" cellpadding="0" cellspacing="0"><tr><td align="center">
+<div style="max-width:680px; margin:0 auto; background:#ffffff; border-radius:20px; overflow:hidden; box-shadow:0 8px 32px rgba(15,23,42,0.1); border:1px solid #e2e8f0;">
+{_email_header_block(today_hdr, 0, 0, gen_ist)}
+    <div style="padding:40px 28px; text-align:center; color:#475569; font-size:16px; line-height:1.65;">No deals in the configured stages today.<br/><span style="font-size:14px; color:#94a3b8;">Pipeline is clear for the selected stages.</span></div>
+    <div style="padding:24px 28px 32px; text-align:center; border-top:1px solid #e2e8f0; background:#f8fafc;">
+        <p style="margin:0; font-size:13px; color:#64748b; line-height:1.65;">This digest was auto-generated by <strong style="color:#1e3a5f;">Adopt AI</strong> for your sales team.<br/><span style="font-size:12px; color:#94a3b8;">Do not reply to this email.</span></p>
     </div>
-    <div style="padding: 24px; text-align: center; color: #666;">No deals in the configured stages today. Pipeline is clear for the selected stages.</div>
-    <div style="text-align: center; color: #9ca3af; font-size: 12px; margin-top: 32px; padding-top: 16px; border-top: 1px solid #e5e7eb;">
-        <p style="margin: 0;">This digest was auto-generated by Sales AI Agent. Do not reply to this email.</p>
-    </div>
+</div>
+</td></tr></table>
 </body>
 </html>
 """

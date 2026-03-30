@@ -95,15 +95,9 @@ def main():
 
     print(f"   ✓ Found: {actual_name} (Stage: {stage_label})")
 
-    try:
-        owners_map = hubspot.get_owners()
-    except Exception as e:
-        print(f"   ⚠️ Could not fetch owners: {e}")
-        owners_map = {}
-
     print(f"\n🔍 Building deal context...")
     try:
-        ctx = build_deal_context(deal, hubspot, owners_map, stage_label)
+        ctx = build_deal_context(deal, hubspot, stage_label)
     except Exception as e:
         print(f"❌ Error building context: {e}")
         import traceback
@@ -116,7 +110,9 @@ def main():
 
     print(f"   Contact: {ctx['contact_name']}, {ctx['contact_title']}")
     print(f"   Company: {ctx['company_name']} | {ctx['company_industry']} | {ctx['company_size']}")
-    print(f"   Value: {ctx['deal_value']} | Owner: {ctx['deal_owner']}")
+    print(f"   Value: {ctx['deal_value']}")
+    if ctx.get("deal_hubspot_url"):
+        print(f"   HubSpot: {ctx['deal_hubspot_url']}")
     print(f"   Last email: {ctx['last_email_date']} — {ctx['last_email_subject'][:50]}...")
     print(f"   Days since activity: {ctx['days_since_activity']}")
 

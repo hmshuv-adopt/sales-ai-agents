@@ -351,6 +351,10 @@ SUMMARY_STAGE_LABELS=Potential Fit,Proposal Sent,Negotiation,Contract
 
 # Email subject; {date} is replaced with today's date (e.g. 2025-03-17)
 EXECUTIVE_SUMMARY_SUBJECT=Daily Deal Pipeline Summary — {date}
+
+# HubSpot account ID (numeric) for "Open deal in HubSpot" links in the digest
+# Find it in the URL when logged in: app.hubspot.com/contacts/{PORTAL_ID}/...
+HUBSPOT_PORTAL_ID=12345678
 ```
 
 Recommended: run daily at 6:00 PM IST (cron: `30 12 * * *` in UTC).
